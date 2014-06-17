@@ -7,8 +7,12 @@
 
 #define ROWS 100000
 
-int main() {
+int main(int argc, char **argv) {
   int retval;
+
+  char *dbname = "./my-db";
+  if (argc > 1)
+    dbname = argv[1];
 
   //sqlite3_vfs *vfs = sqlite3_vfs_find("unix");
   //assert(vfs != NULL);
@@ -20,8 +24,9 @@ int main() {
   assert(retval == 0);
 
   sqlite3 *db;
-  retval = sqlite3_open_v2("./my-db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+  retval = sqlite3_open_v2(dbname, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
   assert(retval == 0);
+  printf("file opened\n");
 
   retval = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS test (value INTEGER);", NULL, NULL, NULL);
   printf("retval is %d\n", retval);
@@ -46,7 +51,7 @@ int main() {
   retval = sqlite3_close_v2(db);
   assert(retval == 0);
 
-  retval = sqlite3_open_v2("my-db", &db, SQLITE_OPEN_READONLY, NULL);
+  retval = sqlite3_open_v2(dbname, &db, SQLITE_OPEN_READONLY, NULL);
   assert(retval == 0);
 
   sqlite3_stmt *sql_sum;

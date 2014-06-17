@@ -145,11 +145,27 @@
 # define SQLITE_RCVFS_BLOCKSZ 4096
 #endif
 
+#ifndef DPRINTF
+//# define DPRINTF(...) printf(__VA_ARGS__)
+# define DPRINTF(...) (0)
+#endif
 
 /*
 ** The maximum pathname length supported by this VFS.
 */
 #define MAXPATHNAME 512
+
+
+static void hex_dump(const char *buf, size_t size) {
+  printf("\n HEXDUMP");
+  unsigned i;
+  for (i = 0; i < size; ++i) {
+    if (i % 32 == 0)
+      printf("\n");
+    printf("%2x ", buf[i] & 0xff);
+  }
+  printf("\n");
+}
 
 
 /**
@@ -297,7 +313,8 @@ static int rcDirectWrite(
   unsigned iAmt,                /* Size of data to write in bytes */
   sqlite_int64 iOfst            /* File offset to write to */
 ){
-  printf("write direct %d %ld\n", iAmt, iOfst);
+  DPRINTF("write direct %d %lld\n", iAmt, iOfst);
+  //hex_dump(zBuf, iAmt);
   if (p->flags & SQLITE_OPEN_READONLY) return SQLITE_READONLY;
 
   RAMCLOUD_BLOCKID blockid;
@@ -354,7 +371,7 @@ static int rcDirectWrite(
   }
 
   p->db.size = (p->db.size > iOfst + iAmt) ? p->db.size : iOfst + iAmt;
-  printf("direct write OK, file size %d\n", p->db.size);
+  DPRINTF("direct write OK, file size %lu\n", p->db.size);
   return SQLITE_OK;
 }
 
@@ -365,6 +382,7 @@ static int rcDirectWrite(
  * a journal file) or if the buffer is currently empty.
  */
 static int rcFlushBuffer(RcFile *p){
+  DPRINTF("flushing buffer\n");
   int result = SQLITE_OK;
   if (p->nBuffer) {
     result = rcDirectWrite(p, p->aBuffer, p->nBuffer, p->iBufferOfst);
@@ -378,7 +396,7 @@ static int rcFlushBuffer(RcFile *p){
  * Close a file.
  */
 static int rcClose(sqlite3_file *pFile) {
-  printf("close\n");
+  DPRINTF("close\n");
   int result;
   RcFile *p = (RcFile*)pFile;
   result = rcFlushBuffer(p);
@@ -405,8 +423,8 @@ static int rcClose(sqlite3_file *pFile) {
                       &(p->db.fileid), sizeof(p->db.fileid), &db, sizeof(db),
                       &rrules, NULL);
   } while (status == STATUS_WRONG_VERSION);
-  printf("close status is %d\n", status);
   if (status != STATUS_OK) return SQLITE_IOERR;
+  DPRINTF("close status is %d\n", status);
   return SQLITE_OK;
 }
 
@@ -420,7 +438,7 @@ static int rcRead(
   int iAmt,
   sqlite_int64 iOfst
 ){
-  printf("read %d %d\n", iAmt, iOfst);
+  DPRINTF("read %d %lld\n", iAmt, iOfst);
   RcFile *p = (RcFile*)pFile;
 
   /* Flush any data in the write buffer to disk in case this operation
@@ -450,9 +468,9 @@ static int rcRead(
     {
       return SQLITE_IOERR_SHORT_READ;
     }
-    printf("read block returned %d\n", status);
+    DPRINTF("read block returned %d\n", status);
     if (status != STATUS_OK) return SQLITE_IOERR_READ;
-    if (size_of_block <= pos_in_block) return SQLITE_IOERR_READ;
+    if (size_of_block <= pos_in_block) return SQLITE_IOERR_SHORT_READ;
 
     size_of_block -= pos_in_block;
     const unsigned nbytes =
@@ -464,7 +482,8 @@ static int rcRead(
     pos_in_block = 0;
   }
 
-  printf("read was fine\n");
+  DPRINTF("read was fine\n");
+  //hex_dump(zBuf, iAmt);
   return SQLITE_OK;
 }
 
@@ -477,7 +496,8 @@ static int rcWrite(
   int iAmt,
   sqlite_int64 iOfst
 ){
-  printf("write\n");
+  DPRINTF("write %d %lld\n", iAmt, iOfst);
+  //hex_dump(zBuf, iAmt);
   RcFile *p = (RcFile*)pFile;
 
   if (p->aBuffer) {
@@ -527,7 +547,7 @@ static int rcWrite(
 */
 // TODO
 static int rcTruncate(sqlite3_file *pFile, sqlite_int64 size){
-  printf("truncate\n");
+  DPRINTF("truncate\n");
 #if 0
   if( ftruncate(((DemoFile *)pFile)->fd, size) ) return SQLITE_IOERR_TRUNCATE;
 #endif
@@ -539,7 +559,7 @@ static int rcTruncate(sqlite3_file *pFile, sqlite_int64 size){
 ** Sync the contents of the file to the persistent media.
 */
 static int rcSync(sqlite3_file *pFile, int flags){
-  printf("syncing\n");
+  DPRINTF("syncing\n");
   RcFile *p = (RcFile*)pFile;
   int retval;
   retval = rcFlushBuffer(p);
@@ -573,7 +593,7 @@ static int rcSync(sqlite3_file *pFile, int flags){
 ** Write the size of the file in bytes to *pSize.
 */
 static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
-  printf("file size\n");
+  DPRINTF("file size\n");
   RcFile *p = (RcFile*)pFile;
 
   /* Flush the contents of the buffer to disk. As with the flush in the
@@ -585,6 +605,7 @@ static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
   if (retval != SQLITE_OK) return retval;
 
   *pSize = p->db.size;
+  DPRINTF("return file size %lld\n", *pSize);
   return SQLITE_OK;
 }
 
@@ -630,35 +651,45 @@ static int rcDeviceCharacteristics(sqlite3_file *pFile){
 ** file has been synced to disk before returning.
 */
 static int rcDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync) {
-  // TODO
-  printf("delete\n");
+  DPRINTF("delete %s\n", zPath);
+
+  RAMCLOUD_FILEID fileid;
+  mk_fileid(zPath, &fileid);
+  RAMCLOUD_SESSION *rc = get_rc_session();
+  RAMCLOUD_DB db;
+  Status status;
+  uint32_t nbytes;
+  status = rc_read(rc->client, rc->tbl_dbs,
+                   &fileid, sizeof(fileid), NULL, NULL,
+                   &db, sizeof(db), &nbytes);
+  switch (status) {
+    case STATUS_OK:
+      break;
+    case STATUS_OBJECT_DOESNT_EXIST:
+      return SQLITE_OK;
+    default:
+      return SQLITE_IOERR_DELETE;
+  }
+  if (nbytes != sizeof(db)) return SQLITE_IOERR_DELETE;
+
+  status = rc_remove(rc->client, rc->tbl_dbs, &fileid, sizeof(fileid),
+                     NULL, NULL);
+  if (status != STATUS_OK) return SQLITE_IOERR_DELETE;
+
+  if (db.size == 0) return SQLITE_OK;
+  unsigned nblocks = ((db.size-1) / db.blocksz) + 1;
+  RAMCLOUD_BLOCKID blockid;
+  blockid.fileid = fileid;
+  unsigned i;
+  for (i = 0; i < nblocks; ++i) {
+    blockid.blockno = i;
+    status = rc_remove(rc->client, rc->tbl_blocks, &blockid, sizeof(blockid),
+                       NULL, NULL);
+    if (status != STATUS_OK) return SQLITE_IOERR_DELETE;
+  }
+
+  DPRINTF("delete Ok\n");
   return SQLITE_OK;
-//  int rc;                         /* Return code */
-//
-//  rc = unlink(zPath);
-//  if( rc!=0 && errno==ENOENT ) return SQLITE_OK;
-//
-//  if( rc==0 && dirSync ){
-//    int dfd;                      /* File descriptor open on directory */
-//    int i;                        /* Iterator variable */
-//    char zDir[MAXPATHNAME+1];     /* Name of directory containing file zPath */
-//
-//    /* Figure out the directory name from the path of the file deleted. */
-//    sqlite3_snprintf(MAXPATHNAME, zDir, "%s", zPath);
-//    zDir[MAXPATHNAME] = '\0';
-//    for(i=strlen(zDir); i>1 && zDir[i]!='/'; i++);
-//    zDir[i] = '\0';
-//
-//    /* Open a file-descriptor on the directory. Sync. Close. */
-//    dfd = open(zDir, O_RDONLY, 0);
-//    if( dfd<0 ){
-//      rc = -1;
-//    }else{
-//      rc = fsync(dfd);
-//      close(dfd);
-//    }
-//  }
-//  return (rc==0 ? SQLITE_OK : SQLITE_IOERR_DELETE);
 }
 
 #ifndef F_OK
@@ -681,7 +712,7 @@ static int rcAccess(
   int flags,
   int *pResOut
 ){
-  printf("access\n");
+  DPRINTF("access %s\n", zPath);
   RAMCLOUD_FILEID fileid;
   mk_fileid(zPath, &fileid);
 
@@ -694,11 +725,14 @@ static int rcAccess(
   switch (status) {
     case STATUS_OK:
       *pResOut = 1;
+      DPRINTF("access yes\n");
       return SQLITE_OK;
     case STATUS_OBJECT_DOESNT_EXIST:
+      DPRINTF("access no\n");
       *pResOut = 0;
       return SQLITE_OK;
     default:
+      DPRINTF("access error\n");
       return SQLITE_IOERR;
   }
 }
@@ -721,6 +755,7 @@ static int rcFullPathname(
   int nPathOut,                   /* Size of output buffer in bytes */
   char *zPathOut                  /* Pointer to output buffer */
 ){
+  DPRINTF("full path name %s\n", zPath);
   char zDir[MAXPATHNAME+1];
   if (zPath[0] == '/') {
     zDir[0] = '\0';
@@ -732,6 +767,7 @@ static int rcFullPathname(
   sqlite3_snprintf(nPathOut, zPathOut, "%s/%s", zDir, zPath);
   zPathOut[nPathOut-1] = '\0';
 
+  DPRINTF("full path name OK\n");
   return SQLITE_OK;
 }
 
@@ -823,7 +859,7 @@ static int rcOpen(
     rcDeviceCharacteristics     /* xDeviceCharacteristics */
   };
 
-  printf("open\n");
+  DPRINTF("open %s\n", zName);
   RcFile *p = (RcFile*)pFile;  /* Populate this structure */
 
   // No support for temporary files yet (TODO: use random Md5 hash)
@@ -838,7 +874,7 @@ static int rcOpen(
   int new_db = 0;
   RAMCLOUD_SESSION *rc = get_rc_session();
   if (flags & SQLITE_OPEN_CREATE) {
-    printf("creating db\n");
+    DPRINTF("creating db\n");
     db.fileid = fileid;
     db.refctr = 1;
     db.blocksz = SQLITE_RCVFS_BLOCKSZ;
@@ -857,12 +893,12 @@ static int rcOpen(
       case STATUS_OBJECT_EXISTS:
         break;
       default:
-        printf("STATUS %d\n", status);
+        DPRINTF("STATUS %d\n", status);
         return SQLITE_CANTOPEN;
     }
   }
   if (!new_db) {
-    printf("existing db\n");
+    DPRINTF("existing db\n");
     struct RejectRules rrules;
     memset(&rrules, 0, sizeof(rrules));
 
@@ -882,7 +918,7 @@ static int rcOpen(
                         &fileid, sizeof(fileid), &db, sizeof(db),
                         &rrules, NULL);
     } while (status == STATUS_WRONG_VERSION);
-    printf("read-modify-write status %d\n", status);
+    DPRINTF("read-modify-write status %d\n", status);
     if (status != STATUS_OK) return SQLITE_CANTOPEN;
   }
 
@@ -896,7 +932,7 @@ static int rcOpen(
   }
   if (pOutFlags) *pOutFlags = flags;
   p->base.pMethods = &rcio;
-  printf("all went fine\n");
+  DPRINTF("all went fine\n");
   return SQLITE_OK;
 }
 
