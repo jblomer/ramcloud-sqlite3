@@ -393,7 +393,7 @@ static int rcDirectWrite(
   unsigned iAmt,                /* Size of data to write in bytes */
   sqlite_int64 iOfst            /* File offset to write to */
 ){
-  DPRINTF("write direct %d %lld\n", iAmt, iOfst);
+  //DPRINTF("write direct %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   if (p->flags & SQLITE_OPEN_READONLY) return SQLITE_READONLY;
 
@@ -451,7 +451,7 @@ static int rcDirectWrite(
 
   p->handle.size = (p->handle.size > iOfst + iAmt) ?
                    p->handle.size : iOfst + iAmt;
-  DPRINTF("direct write OK, file size %lu\n", p->handle.size);
+  //DPRINTF("direct write OK, file size %lu\n", p->handle.size);
   return SQLITE_OK;
 }
 
@@ -462,7 +462,7 @@ static int rcDirectWrite(
  * a journal file) or if the buffer is currently empty.
  */
 static int rcFlushBuffer(SQLITE_RCVFS_SESSION *rcs, RcFile *p){
-  DPRINTF("flushing buffer\n");
+  //DPRINTF("flushing buffer\n");
   int result = SQLITE_OK;
   if (p->nBuffer) {
     result = rcDirectWrite(rcs, p, p->aBuffer, p->nBuffer, p->iBufferOfst);
@@ -519,7 +519,7 @@ static int rcRead(
   sqlite_int64 iOfst
 ){
   //printf("R %d %lld\n", iAmt, iOfst);
-  DPRINTF("read %d %lld\n", iAmt, iOfst);
+  //DPRINTF("read %d %lld\n", iAmt, iOfst);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_READ;
@@ -550,7 +550,7 @@ static int rcRead(
     {
       return SQLITE_IOERR_SHORT_READ;
     }
-    DPRINTF("read block returned %d\n", status);
+    //DPRINTF("read block returned %d\n", status);
     if (status != STATUS_OK) return SQLITE_IOERR_READ;
     if (size_of_block <= pos_in_block) return SQLITE_IOERR_READ;
 
@@ -564,7 +564,7 @@ static int rcRead(
     pos_in_block = 0;
   }
 
-  DPRINTF("read was fine\n");
+  //DPRINTF("read was fine\n");
   //hex_dump(zBuf, iAmt);
   return SQLITE_OK;
 }
@@ -580,7 +580,7 @@ static int rcWrite(
   sqlite_int64 iOfst
 ){
   //printf("W %d %lld\n", iAmt, iOfst);
-  DPRINTF("write %d %lld\n", iAmt, iOfst);
+  //DPRINTF("write %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
@@ -952,36 +952,44 @@ static int rcOpen(
 
   Status status;
   int new_db = 0;
-  if (flags & SQLITE_OPEN_CREATE) {
+  uint64_t tblid;
+  status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
+  switch (status) {
+    case STATUS_OK:
+      if ((flags & SQLITE_OPEN_CREATE) && (flags & SQLITE_OPEN_EXCLUSIVE)) {
+        DPRINTF("exclusive open but table exists\n");
+        free_dbid(dbid);
+        return SQLITE_CANTOPEN;
+      }
+      break;
+    case STATUS_TABLE_DOESNT_EXIST:
+      if (!(flags & SQLITE_OPEN_CREATE)) return SQLITE_CANTOPEN;
+      new_db = 1;
+      break;
+    default:
+      free_dbid(dbid);
+      return SQLITE_CANTOPEN;
+  }
+
+  if (new_db) {
     DPRINTF("creating db\n");
     dbheader.version = 1;
     dbheader.blocksz = SQLITE_RCVFS_BLOCKSZ;
 
     status = rc_createTable(rcs->client, dbid.table_name, 1);
-    switch (status) {
-      case STATUS_OK:
-        new_db = 1;
-        break;
-      case STATUS_OBJECT_EXISTS:
-        if (flags & SQLITE_OPEN_EXCLUSIVE) return SQLITE_CANTOPEN;
-        break;
-      default:
-        DPRINTF("STATUS %d\n", status);
-        free_dbid(dbid);
-        return SQLITE_CANTOPEN;
+    if (status != STATUS_OK) {
+      free_dbid(dbid);
+      return SQLITE_CANTOPEN;
     }
-  }
-
-  uint64_t tblid;
-  status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
-  free_dbid(dbid);
-  if (status != STATUS_OK) return SQLITE_CANTOPEN;
-
-  if (new_db) {
+    status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
+    free_dbid(dbid);
+    if (status != STATUS_OK) return SQLITE_CANTOPEN;
     status = rc_write(rcs->client, tblid,
                       &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
                       &dbheader, sizeof(dbheader), NULL, NULL);
   } else {
+    DPRINTF("reading header\n");
+    free_dbid(dbid);
     uint32_t nbytes;
     status = rc_read(rcs->client, tblid,
                      &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
