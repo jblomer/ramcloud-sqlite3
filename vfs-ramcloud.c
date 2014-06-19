@@ -117,6 +117,7 @@
 
 #include <alloca.h>
 #include <assert.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -128,6 +129,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/param.h>
+#include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -135,9 +137,8 @@
 #include "sqlite3.h"
 #include <ramcloud/CRamCloud.h>
 
-/*
-** Size of the write buffer used by journal files in bytes.
-*/
+
+// Size of the write buffer used by journal files in bytes.
 #ifndef SQLITE_RCVFS_BUFFERSZ
 # define SQLITE_RCVFS_BUFFERSZ 8192
 #endif
@@ -157,7 +158,7 @@
 /*
 ** The maximum pathname length supported by this VFS.
 */
-#define MAXPATHNAME 512
+#define MAXPATHNAME 4096
 
 
 static void hex_dump(const char *buf, size_t size) {
@@ -705,12 +706,18 @@ static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
  * file is found in the file-system it is rolled back.
  */
 static int rcLock(sqlite3_file *pFile, int eLock){
+  RcFile *p = (RcFile *)pFile;
+  printf("lock %lu\n", p->handle.tblid);
   return SQLITE_OK;
 }
 static int rcUnlock(sqlite3_file *pFile, int eLock){
+  RcFile *p = (RcFile *)pFile;
+  printf("unlock %lu\n", p->handle.tblid);
   return SQLITE_OK;
 }
 static int rcCheckReservedLock(sqlite3_file *pFile, int *pResOut){
+  RcFile *p = (RcFile *)pFile;
+  printf("reserve lock %lu\n", p->handle.tblid);
   *pResOut = 0;
   return SQLITE_OK;
 }
@@ -848,38 +855,59 @@ static int rcFullPathname(
   return SQLITE_OK;
 }
 
-/*
-** The following four VFS methods:
-**
-**   xDlOpen
-**   xDlError
-**   xDlSym
-**   xDlClose
-**
-** are supposed to implement the functionality needed by SQLite to load
-** extensions compiled as shared objects. This simple VFS does not support
-** this functionality, so the following functions are no-ops.
-*/
+/**
+ * The following four VFS methods:
+ *
+ *   xDlOpen
+ *   xDlError
+ *   xDlSym
+ *   xDlClose
+ *
+ * are supposed to implement the functionality needed by SQLite to load
+ * extensions compiled as shared objects. Taken from unixVfs
+ */
 static void *rcDlOpen(sqlite3_vfs *pVfs, const char *zPath){
-  return 0;
-}
-static void rcDlError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg){
-  sqlite3_snprintf(nByte, zErrMsg, "Loadable extensions are not supported");
-  zErrMsg[nByte-1] = '\0';
-}
-static void (*rcDlSym(sqlite3_vfs *pVfs, void *pH, const char *z))(void){
-  return 0;
-}
-static void rcDlClose(sqlite3_vfs *pVfs, void *pHandle){
-  return;
+  return dlopen(zPath, RTLD_NOW | RTLD_GLOBAL);
 }
 
-/*
-** Parameter zByte points to a buffer nByte bytes in size. Populate this
-** buffer with pseudo-random data.
-*/
-static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte){
-  return SQLITE_OK;
+static void rcDlError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg){
+  sqlite3_snprintf(nByte, zErrMsg, "rcDlError not supported");
+  zErrMsg[nByte-1] = '\0';
+}
+
+static void (*rcDlSym(sqlite3_vfs *pVfs, void *pH, const char *zSym))(void){
+  return dlsym(pH, zSym);
+}
+
+static void rcDlClose(sqlite3_vfs *pVfs, void *pHandle){
+  dlclose(pHandle);
+}
+
+/**
+ * Parameter zByte points to a buffer nByte bytes in size. Populate this
+ * buffer with pseudo-random data.
+ * Taken from default implementation
+ */
+static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte) {
+  assert((size_t)nByte >= (sizeof(time_t) + sizeof(int)));
+  memset(zByte, 0, nByte);
+  pid_t randomnessPid = getpid();
+  int fd, got;
+  fd = open("/dev/urandom", O_RDONLY);
+  if(fd < 0) {
+    time_t t;
+    time(&t);
+    memcpy(zByte, &t, sizeof(t));
+    memcpy(&zByte[sizeof(t)], &randomnessPid, sizeof(randomnessPid));
+    assert(sizeof(t) + sizeof(randomnessPid) <= (size_t)nByte);
+    nByte = sizeof(t) + sizeof(randomnessPid);
+  } else {
+    do {
+      got = read(fd, zByte, nByte);
+    } while (got<0 && errno==EINTR);
+    close(fd);
+  }
+  return nByte;
 }
 
 /*
@@ -887,22 +915,24 @@ static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte){
 ** of microseconds slept for.
 */
 static int rcSleep(sqlite3_vfs *pVfs, int nMicro){
-  sleep(nMicro / 1000000);
-  usleep(nMicro % 1000000);
+  struct timeval wait_for;
+  wait_for.tv_sec = nMicro / 1000000;
+  wait_for.tv_usec = nMicro % 1000000;
+  select(0, NULL, NULL, NULL, &wait_for);
   return nMicro;
 }
 
-/*
-** Set *pTime to the current UTC time expressed as a Julian day. Return
-** SQLITE_OK if successful, or an error code otherwise.
-**
-**   http://en.wikipedia.org/wiki/Julian_day
-**
-** This implementation is not very good. The current time is rounded to
-** an integer number of seconds. Also, assuming time_t is a signed 32-bit
-** value, it will stop working some time in the year 2038 AD (the so-called
-** "year 2038" problem that afflicts systems that store time this way).
-*/
+/**
+ * Set *pTime to the current UTC time expressed as a Julian day. Return
+ * SQLITE_OK if successful, or an error code otherwise.
+ *
+ *   http://en.wikipedia.org/wiki/Julian_day
+ *
+ * This implementation is not very good. The current time is rounded to
+ * an integer number of seconds. Also, assuming time_t is a signed 32-bit
+ * value, it will stop working some time in the year 2038 AD (the so-called
+ * "year 2038" problem that afflicts systems that store time this way).
+ */
 static int rcCurrentTime(sqlite3_vfs *pVfs, double *pTime){
   time_t t = time(0);
   *pTime = t/86400.0 + 2440587.5;
@@ -1020,7 +1050,7 @@ static int rcOpen(
  * To make the VFS available to SQLite:
  *
  *   RAMCLOUD_CONNECTON *conn =
-*      sqlite3_rcvfs_connect("zk:localhost:2181", "main");
+ *     sqlite3_rcvfs_connect("zk:localhost:2181", "main");
  *   sqlite3_vfs_register("ramcloud", sqlite3_rcvfs(conn), 0);
  */
 sqlite3_vfs *sqlite3_rcvfs(
