@@ -154,6 +154,9 @@
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
+// Allocate so many leases on stack and only use malloc if this is not enough
+#define SQLITE_RCVFS_STACKLEASES 8
+#define SQLITE_RCVFS_LEASETIME 20  // 20 seconds lease time
 
 /*
 ** The maximum pathname length supported by this VFS.
@@ -171,6 +174,8 @@
   }
   printf("\n");
 }*/
+
+static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte);
 
 
 typedef struct sqlite3_rcvfs_connection SQLITE_RCVFS_CONNECTION;
@@ -213,16 +218,38 @@ static SQLITE_RCVFS_SESSION *get_rc_session(SQLITE_RCVFS_CONNECTION *conn) {
 /**
  * Database locks
  */
+typedef struct sqlite3_rcvfs_token SQLITE_RCVFS_TOKEN;
+struct sqlite3_rcvfs_token {
+  unsigned char digest[19];  // Random 152bits token (0: unlocked)
+};
+static SQLITE_RCVFS_TOKEN mk_token() {
+  SQLITE_RCVFS_TOKEN result;
+  int retval = rcRandomness(NULL, 19, (char *)result.digest);
+  assert(retval == 19);
+  return result;
+}
 typedef struct sqlite3_rcvfs_lease SQLITE_RCVFS_LEASE;
 struct sqlite3_rcvfs_lease {
-  unsigned char digest[16];  // Random 128bits token (0: unlocked)
+  char lease_type;
+  SQLITE_RCVFS_TOKEN token;
   time_t deadline;           // Lease expires once dealine passed
 };
-static int is_locked(SQLITE_RCVFS_LEASE *lease) {
+static int is_owned(
+  const SQLITE_RCVFS_LEASE *lease,
+  const SQLITE_RCVFS_TOKEN *my_token
+){
   unsigned i;
-  for (i = 0; i < sizeof(lease->digest); ++i) {
-    if (lease->digest[i])
-      return lease->deadline + SQLITE_RCVFS_TIMESKEW > time(NULL);
+  for (i = 0; i < sizeof(lease->token.digest); ++i) {
+    if (lease->token.digest[i] != my_token->digest[i])
+      return 0;
+  }
+  return 1;
+}
+static int is_locked(const SQLITE_RCVFS_LEASE *lease) {
+  unsigned i;
+  for (i = 0; i < sizeof(lease->token.digest); ++i) {
+    if (lease->token.digest[i])
+      return lease->deadline + SQLITE_RCVFS_TIMESKEW < time(NULL);
   }
   return 0;
 }
@@ -235,7 +262,6 @@ typedef struct sqlite3_rcvfs_dbid SQLITE_RCVFS_DBID;
 struct sqlite3_rcvfs_dbid {
   char table_name[33];
 };
-static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte);
 static SQLITE_RCVFS_DBID mk_dbid(const char *path) {
   SQLITE_RCVFS_DBID result;
   md5_state_t pms;
@@ -275,6 +301,7 @@ struct sqlite3_rcvfs_handle {
   uint64_t size;
   uint64_t blocksz;
   SQLITE_RCVFS_DBID dbid;
+  SQLITE_RCVFS_TOKEN token;
 };
 
 
@@ -286,6 +313,7 @@ struct sqlite3_rcvfs_blockid {
   uint64_t blockno;
 };
 SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_HEADERBLOCK = { (uint64_t)(-1) };
+SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_LCBLOCK     = { (uint64_t)(-2) };
 
 
 typedef struct RcFile RcFile;
@@ -710,28 +738,303 @@ static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
   return SQLITE_OK;
 }
 
+#define NO_LOCK         0
+#define SHARED_LOCK     1
+#define RESERVED_LOCK   2
+#define PENDING_LOCK    3
+#define EXCLUSIVE_LOCK  4
+
 /**
- * Locking functions. The xLock() and xUnlock() methods are both no-ops.
- * The xCheckReservedLock() always indicates that no other process holds
- * a reserved lock on the database file. This ensures that if a hot-journal
- * file is found in the file-system it is rolled back.
+ * Reads the leases from the lock control block.  The leases array has
+ * room for at least one more lock upon return.  Leases can be pre-allocated
+ * on the stack when entering the function.  If it needs to be enlarged, it
+ * will be malloc'd (the original leases won't be freed).
+ * Returns the version number of the lock control block in lcbVersion.
+ * If nLeasesOut > nLeases, the leases array needs to be freed by the caller.
+ */
+static int get_lockcb(
+  SQLITE_RCVFS_SESSION *rcs,
+  uint64_t tblid,
+  uint32_t nLeases,
+  SQLITE_RCVFS_LEASE **leases,
+  uint32_t *nLeasesOut,
+  uint64_t *lcbVersion
+){
+  Status status;
+  uint32_t nbytes = 0;
+  int short_read = 0;
+  do {
+    status =
+      rc_read(rcs->client, tblid,
+              &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+              NULL, lcbVersion,
+              *leases, nLeases*sizeof(SQLITE_RCVFS_LEASE), &nbytes);
+    switch (status) {
+      case STATUS_OBJECT_DOESNT_EXIST:
+      case STATUS_OK:
+        *nLeasesOut = nbytes/sizeof(SQLITE_RCVFS_LEASE);
+        if (*nLeasesOut >= nLeases) {
+          if (short_read) sqlite3_free(*leases);
+          short_read = 1;
+          nLeases = *nLeasesOut + 1;
+          *leases = (SQLITE_RCVFS_LEASE *)sqlite3_malloc(nLeases);
+        }
+        break;
+      default:
+        if (short_read) sqlite3_free(*leases);
+        return SQLITE_IOERR_LOCK;
+    }
+  } while (short_read);
+
+  DPRINTF("retrieved lock control block of size %d\n", *nLeasesOut);
+  return SQLITE_OK;
+}
+
+static void cleanup_lockcb(
+  SQLITE_RCVFS_LEASE *leases,
+  SQLITE_RCVFS_TOKEN *my_token,
+  char max_lease_type,
+  uint32_t nleases,
+  uint32_t *nLeasesOut
+){
+  *nLeasesOut = nleases;
+  uint32_t i;
+  for (i = 0; i < *nLeasesOut; ) {
+    int owned = is_owned(&leases[i], my_token);
+    int valid_lease = is_locked(&leases[i]);
+    if (owned && (leases[i].lease_type == PENDING_LOCK)) valid_lease = 0;
+    if (owned && (leases[i].lease_type > max_lease_type)) valid_lease = 0;
+
+    if (!valid_lease) {
+      DPRINTF("removing a lock (mylock: %d)\n", is_owned(&leases[i], my_token));
+      // Shrink array
+      uint32_t j;
+      for (j = i+1; j < *nLeasesOut; ++j)
+        leases[j-1] = leases[j];
+      *nLeasesOut = *nLeasesOut - 1;
+    } else {
+      ++i;
+    }
+  }
+}
+
+
+/**
+ * Locking.
  */
 static int rcLock(sqlite3_file *pFile, int eLock){
+  DPRINTF("lock %d\n", eLock);
   RcFile *p = (RcFile *)pFile;
-  printf("lock %lu\n", p->handle.tblid);
-  return SQLITE_OK;
+  SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
+  if (!rcs) return SQLITE_IOERR_LOCK;
+  uint64_t tblid = p->handle.tblid;
+  SQLITE_RCVFS_LEASE *leases = (SQLITE_RCVFS_LEASE *)
+    alloca(SQLITE_RCVFS_STACKLEASES * sizeof(SQLITE_RCVFS_LEASE));
+  SQLITE_RCVFS_LEASE *leases_on_stack = leases;
+  SQLITE_RCVFS_LEASE new_lease;
+  memset(&new_lease, 0, sizeof(new_lease));
+  new_lease.lease_type = eLock;
+  new_lease.token = p->handle.token;
+  new_lease.deadline = time(NULL) + SQLITE_RCVFS_LEASETIME;
+
+  int result;
+  do {
+    result = -1;
+    if (leases != leases_on_stack) {
+      sqlite3_free(leases);
+      leases = leases_on_stack;
+    }
+    uint32_t nleases;
+    uint64_t lcbVersion;
+    int retval;
+    retval = get_lockcb(rcs, tblid, SQLITE_RCVFS_STACKLEASES,
+                        &leases, &nleases, &lcbVersion);
+    if (retval != SQLITE_OK) return retval;
+
+    struct RejectRules rrules;
+    memset(&rrules, 0, sizeof(rrules));
+    if (nleases == 0) rrules.exists = 1;
+    else rrules.givenVersion = lcbVersion;
+
+    cleanup_lockcb(leases, &(p->handle.token), EXCLUSIVE_LOCK, nleases,
+                   &nleases);
+    int other_shared = 0;
+    int other_reserved = 0;
+    int other_pending = 0;
+    int other_exclusive = 0;
+    unsigned i;
+    for (i = 0; i < nleases; ++i) {
+      DPRINTF("found a lock of type %d\n", leases[i].lease_type & 0xff);
+      if (is_owned(&leases[i], &(p->handle.token))) {
+        // Do I have already a lock of the required type or better?
+        if (leases[i].lease_type >= eLock) {
+          result = SQLITE_OK;
+          break;
+        }
+      } else {
+        // Not my locks
+        if (leases[i].lease_type == SHARED_LOCK) other_shared = 1;
+        if (leases[i].lease_type == RESERVED_LOCK) other_reserved = 1;
+        if (leases[i].lease_type == PENDING_LOCK) other_pending = 1;
+        if (leases[i].lease_type == EXCLUSIVE_LOCK) other_exclusive = 1;
+      }
+    }
+    switch (eLock) {
+      case SHARED_LOCK:
+        if (!other_pending && !other_exclusive) result = SQLITE_OK;
+        else result = SQLITE_BUSY;
+        break;
+      case RESERVED_LOCK:
+        if (!other_reserved && !other_pending && !other_exclusive)
+          result = SQLITE_OK;
+        else
+          result = SQLITE_BUSY;
+        break;
+      case EXCLUSIVE_LOCK:
+        if (other_shared || other_reserved || other_pending || other_exclusive)
+          result = SQLITE_BUSY;
+        else
+          result = SQLITE_OK;
+        break;
+      default:
+        result = SQLITE_ERROR;
+    }
+
+    int new_lockcb = 0;
+    if (result == SQLITE_OK) new_lockcb = 1;
+    if ((result == SQLITE_BUSY) && (eLock == EXCLUSIVE_LOCK) &&
+        !other_pending && !other_reserved)
+    {
+      new_lockcb = 1;
+      new_lease.lease_type = PENDING_LOCK;
+    }
+    if (new_lockcb) {
+      DPRINTF("writing new lockcb of size %d\n", nleases+1);
+      leases[nleases] = new_lease;
+      Status status =
+        rc_write(rcs->client, tblid,
+                 &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+                 leases, (nleases+1) * sizeof(SQLITE_RCVFS_LEASE),
+                 &rrules, NULL);
+      switch (status) {
+        case STATUS_OK:
+          break;
+        case STATUS_OBJECT_EXISTS:
+        case STATUS_WRONG_VERSION:
+          result = -1;
+          break;
+        default:
+          result = SQLITE_IOERR_LOCK;
+      }
+    }
+  } while (result < 0);
+
+  DPRINTF("lock result %d\n", result);
+  if (leases != leases_on_stack) sqlite3_free(leases);
+  return result;
 }
-static int rcUnlock(sqlite3_file *pFile, int eLock){
+
+
+static int rcUnlock(sqlite3_file *pFile, int eLock) {
+  DPRINTF("unlock to new level %d\n", eLock);
   RcFile *p = (RcFile *)pFile;
-  printf("unlock %lu\n", p->handle.tblid);
-  return SQLITE_OK;
+  SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
+  if (!rcs) return SQLITE_IOERR_LOCK;
+  uint64_t tblid = p->handle.tblid;
+  SQLITE_RCVFS_LEASE *leases = (SQLITE_RCVFS_LEASE *)
+    alloca(SQLITE_RCVFS_STACKLEASES * sizeof(SQLITE_RCVFS_LEASE));
+  SQLITE_RCVFS_LEASE *leases_on_stack = leases;
+
+  int result;
+  do {
+    result = -1;
+    if (leases != leases_on_stack) {
+      sqlite3_free(leases);
+      leases = leases_on_stack;
+    }
+    uint32_t nleases;
+    uint64_t lcbVersion;
+    int retval;
+    retval = get_lockcb(rcs, tblid, SQLITE_RCVFS_STACKLEASES,
+                        &leases, &nleases, &lcbVersion);
+    if (retval != SQLITE_OK) return retval;
+    DPRINTF("retrieved %d leases\n", nleases);
+    if (nleases == 0) return SQLITE_OK;
+
+    struct RejectRules rrules;
+    memset(&rrules, 0, sizeof(rrules));
+    rrules.givenVersion = lcbVersion;
+
+    cleanup_lockcb(leases, &(p->handle.token), NO_LOCK, nleases, &nleases);
+    if (eLock == SHARED_LOCK) {
+      SQLITE_RCVFS_LEASE new_lease;
+      memset(&new_lease, 0, sizeof(new_lease));
+      new_lease.lease_type = SHARED_LOCK;
+      new_lease.token = p->handle.token;
+      new_lease.deadline = time(NULL) + SQLITE_RCVFS_LEASETIME;
+      leases[nleases] = new_lease;
+      nleases++;
+    }
+    DPRINTF("cleanup+mod: now %d leases\n", nleases);
+    result = SQLITE_OK;
+
+    Status status;
+    if (nleases == 0) {
+      status = rc_remove(rcs->client, tblid,
+                         &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+                         &rrules, NULL);
+    } else {
+      status = rc_write(rcs->client, tblid,
+                        &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+                        leases, nleases * sizeof(SQLITE_RCVFS_LEASE),
+                        &rrules, NULL);
+    }
+    switch (status) {
+      case STATUS_OK:
+        break;
+      case STATUS_WRONG_VERSION:
+        result = -1;
+        break;
+      default:
+        result = SQLITE_IOERR_LOCK;
+    }
+  } while (result < 0);
+
+  DPRINTF("unlock result %d\n", result);
+  if (leases != leases_on_stack) sqlite3_free(leases);
+  return result;
 }
+
+
 static int rcCheckReservedLock(sqlite3_file *pFile, int *pResOut){
+  printf("check reserve lock\n");
   RcFile *p = (RcFile *)pFile;
-  printf("reserve lock %lu\n", p->handle.tblid);
+  SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
+  if (!rcs) return SQLITE_IOERR_LOCK;
+  uint64_t tblid = p->handle.tblid;
+  SQLITE_RCVFS_LEASE *leases = (SQLITE_RCVFS_LEASE *)
+    alloca(SQLITE_RCVFS_STACKLEASES * sizeof(SQLITE_RCVFS_LEASE));
+  SQLITE_RCVFS_LEASE *leases_on_stack = leases;
+
+  uint32_t nleases;
+  uint64_t lcbVersion;
+  int retval;
+  retval = get_lockcb(rcs, tblid, SQLITE_RCVFS_STACKLEASES,
+                      &leases, &nleases, &lcbVersion);
+  if (retval != SQLITE_OK) return retval;
+
   *pResOut = 0;
+  unsigned i;
+  for (i = 0; i < nleases; ++i) {
+    if (is_locked(&leases[i]) && (leases[i].lease_type == RESERVED_LOCK)) {
+      *pResOut = 1;
+      break;
+    }
+  }
+  if (leases != leases_on_stack) sqlite3_free(leases);
   return SQLITE_OK;
 }
+
 
 /**
  * No xFileControl() verbs are implemented by this VFS.
@@ -1044,6 +1347,7 @@ static int rcOpen(
   }
 
   memset(p, 0, sizeof(RcFile));
+  p->handle.token = mk_token();
   p->handle.conn = conn;
   p->handle.dbid = dbid;
   p->handle.tblid = tblid;
