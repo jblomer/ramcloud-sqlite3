@@ -1,4 +1,7 @@
-all: libsqlite3.a libvfs-ramcloud.a test
+all: libsqlite3.a libvfs-ramcloud.a test test2
+
+test2: test2.c vfs-ramcloud.h libvfs-ramcloud.a libsqlite3.a
+	gcc -pthread -std=c99 -O2 -g -Wall -o test2 test2.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
 
 test: test.c vfs-ramcloud.h libvfs-ramcloud.a libsqlite3.a
 	gcc -pthread -std=c99 -O2 -g -Wall -o test test.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
@@ -18,5 +21,4 @@ clean:
 	rm -f *.o *.d
 	rm -f libsqlite3.a
 	rm -f libvfs-ramcloud.a
-	rm -f test
-
+	rm -f test test2
