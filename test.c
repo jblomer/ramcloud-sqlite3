@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
   //sqlite3_vfs *vfs = sqlite3_vfs_find("unix");
   //assert(vfs != NULL);
   //retval = sqlite3_vfs_register(vfs, 1);
-  SQLITE_RCVFS_CONNECTION *conn = 
+  SQLITE_RCVFS_CONNECTION *conn =
     sqlite3_rcvfs_connect("zk:localhost:2181", "main");
   assert(conn != NULL);
   retval = sqlite3_vfs_register(sqlite3_rcvfs("ramcloud", conn), 1);
@@ -29,6 +29,10 @@ int main(int argc, char **argv) {
   printf("file opened\n");
 
   retval = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS test (value INTEGER);", NULL, NULL, NULL);
+  printf("retval is %d\n", retval);
+  assert(retval == 0);
+
+  retval = sqlite3_exec(db, "CREATE TEMP TABLE temp (value INTEGER);", NULL, NULL, NULL);
   printf("retval is %d\n", retval);
   assert(retval == 0);
 

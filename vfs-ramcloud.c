@@ -161,7 +161,7 @@
 #define MAXPATHNAME 4096
 
 
-static void hex_dump(const char *buf, size_t size) {
+/*static void hex_dump(const char *buf, size_t size) {
   printf("\n HEXDUMP");
   unsigned i;
   for (i = 0; i < size; ++i) {
@@ -170,7 +170,7 @@ static void hex_dump(const char *buf, size_t size) {
     printf("%2x ", buf[i] & 0xff);
   }
   printf("\n");
-}
+}*/
 
 
 typedef struct sqlite3_rcvfs_connection SQLITE_RCVFS_CONNECTION;
@@ -233,33 +233,32 @@ static int is_locked(SQLITE_RCVFS_LEASE *lease) {
  */
 typedef struct sqlite3_rcvfs_dbid SQLITE_RCVFS_DBID;
 struct sqlite3_rcvfs_dbid {
-  char *table_name;
+  char table_name[33];
 };
+static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte);
 static SQLITE_RCVFS_DBID mk_dbid(const char *path) {
+  SQLITE_RCVFS_DBID result;
   md5_state_t pms;
   md5_byte_t digest[16];
-  char *hex = (char *)sqlite3_malloc(33);
-  md5_init(&pms);
-  md5_append(&pms, (const md5_byte_t *)path, strlen(path));
-  md5_finish(&pms, digest);
-
+  if (path) {
+    md5_init(&pms);
+    md5_append(&pms, (const md5_byte_t *)path, strlen(path));
+    md5_finish(&pms, digest);
+  } else {
+    int retval = rcRandomness(NULL, 16, (char *)digest);
+    assert(retval == 16);
+  }
   unsigned i;
   for (i = 0; i < 16; ++i) {
     char dgt1 = (unsigned)digest[i] / 16;
     char dgt2 = (unsigned)digest[i] % 16;
     dgt1 += (dgt1 <= 9) ? '0' : 'a' - 10;
     dgt2 += (dgt2 <= 9) ? '0' : 'a' - 10;
-    hex[i*2] = dgt1;
-    hex[i*2+1] = dgt2;
+    result.table_name[i*2] = dgt1;
+    result.table_name[i*2+1] = dgt2;
   }
-  hex[32] = '\0';
-
-  SQLITE_RCVFS_DBID result;
-  result.table_name = hex;
+  result.table_name[32] = '\0';
   return result;
-}
-static void free_dbid(SQLITE_RCVFS_DBID dbid) {
-  sqlite3_free(dbid.table_name);
 }
 typedef struct sqlite3_rcvfs_dbheader SQLITE_RCVFS_DBHEADER;
 struct sqlite3_rcvfs_dbheader {
@@ -275,6 +274,7 @@ struct sqlite3_rcvfs_handle {
   uint64_t tblid;
   uint64_t size;
   uint64_t blocksz;
+  SQLITE_RCVFS_DBID dbid;
 };
 
 
@@ -482,13 +482,24 @@ static int rcClose(sqlite3_file *pFile) {
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR;
+  Status status;
+
   result = rcFlushBuffer(rcs, p);
   sqlite3_free(p->aBuffer);
+
+  if (p->flags & SQLITE_OPEN_DELETEONCLOSE) {
+    status = rc_dropTable(rcs->client, p->handle.dbid.table_name);
+    switch (status) {
+      case STATUS_OK:
+        return SQLITE_OK;
+      default:
+        return SQLITE_IOERR_DELETE;
+    }
+  }
 
   SQLITE_RCVFS_DBHEADER dbheader;
   struct RejectRules rrules;
   memset(&rrules, 0, sizeof(rrules));
-  Status status;
   do {  // Read-modify-write
     uint64_t version;
     uint32_t nbytes;
@@ -762,7 +773,6 @@ static int rcDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync) {
   if (status == STATUS_TABLE_DOESNT_EXIST) return SQLITE_OK;
 
   status = rc_dropTable(rcs->client, dbid.table_name);
-  free_dbid(dbid);
   switch (status) {
     case STATUS_OK:
       // Fall through
@@ -805,7 +815,6 @@ static int rcAccess(
   uint64_t tblid;
   SQLITE_RCVFS_DBID dbid = mk_dbid(zPath);
   Status status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
-  free_dbid(dbid);
   switch (status) {
     case STATUS_OK:
       *pResOut = 1;
@@ -886,7 +895,7 @@ static void rcDlClose(sqlite3_vfs *pVfs, void *pHandle){
 /**
  * Parameter zByte points to a buffer nByte bytes in size. Populate this
  * buffer with pseudo-random data.
- * Taken from default implementation
+ * Taken from default implementation.
  */
 static int rcRandomness(sqlite3_vfs *pVfs, int nByte, char *zByte) {
   assert((size_t)nByte >= (sizeof(time_t) + sizeof(int)));
@@ -974,8 +983,7 @@ static int rcOpen(
 
   RcFile *p = (RcFile*)pFile;  // Populate this structure
 
-  // No support for temporary files yet (TODO: use random name)
-  if (zName == 0) return SQLITE_IOERR;
+  // For temporary files (zName == 0) random name is used
   SQLITE_RCVFS_DBID dbid = mk_dbid(zName);
   SQLITE_RCVFS_DBHEADER dbheader;
   memset(&dbheader, 0, sizeof(dbheader));
@@ -988,7 +996,6 @@ static int rcOpen(
     case STATUS_OK:
       if ((flags & SQLITE_OPEN_CREATE) && (flags & SQLITE_OPEN_EXCLUSIVE)) {
         DPRINTF("exclusive open but table exists\n");
-        free_dbid(dbid);
         return SQLITE_CANTOPEN;
       }
       break;
@@ -997,7 +1004,6 @@ static int rcOpen(
       new_db = 1;
       break;
     default:
-      free_dbid(dbid);
       return SQLITE_CANTOPEN;
   }
 
@@ -1007,28 +1013,39 @@ static int rcOpen(
     dbheader.blocksz = SQLITE_RCVFS_BLOCKSZ;
 
     status = rc_createTable(rcs->client, dbid.table_name, 1);
-    if (status != STATUS_OK) {
-      free_dbid(dbid);
-      return SQLITE_CANTOPEN;
-    }
-    status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
-    free_dbid(dbid);
     if (status != STATUS_OK) return SQLITE_CANTOPEN;
+    status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
+    if (status != STATUS_OK) return SQLITE_CANTOPEN;
+    struct RejectRules rrules;
+    memset(&rrules, 0, sizeof(rrules));
+    rrules.exists = 1;
     status = rc_write(rcs->client, tblid,
                       &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
-                      &dbheader, sizeof(dbheader), NULL, NULL);
-  } else {
+                      &dbheader, sizeof(dbheader), &rrules, NULL);
+    switch (status) {
+      case STATUS_OBJECT_EXISTS:
+        if (flags & SQLITE_OPEN_EXCLUSIVE) return SQLITE_CANTOPEN;
+        new_db = 0;
+        break;
+      case STATUS_OK:
+        break;
+      default:
+        return SQLITE_CANTOPEN;
+    }
+  }
+
+  if (!new_db) {
     DPRINTF("reading header\n");
-    free_dbid(dbid);
     uint32_t nbytes;
     status = rc_read(rcs->client, tblid,
                      &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
                      NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
+    if (status != STATUS_OK) return SQLITE_CANTOPEN;
   }
-  if (status != STATUS_OK) return SQLITE_CANTOPEN;
 
   memset(p, 0, sizeof(RcFile));
   p->handle.conn = conn;
+  p->handle.dbid = dbid;
   p->handle.tblid = tblid;
   p->handle.size = dbheader.size;
   p->handle.blocksz = dbheader.blocksz;
