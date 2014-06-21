@@ -149,8 +149,8 @@
 #endif
 
 #ifndef DPRINTF
-# define DPRINTF(...) printf(__VA_ARGS__)
-//# define DPRINTF(...) (0)
+//# define DPRINTF(...) printf(__VA_ARGS__)
+# define DPRINTF(...) (0)
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
@@ -341,8 +341,7 @@ static char *sqlite3_strdup(const char *str) {
 
 static void sqlite3_rcvfs_tls_destructor(void *data) {
   SQLITE_RCVFS_SESSION *rcs = (SQLITE_RCVFS_SESSION *)data;
-  if (rcs->client)
-    rc_disconnect(rcs->client);
+  if (rcs->client) rc_disconnect(rcs->client);
   sqlite3_free(rcs);
 }
 
@@ -546,6 +545,7 @@ static int rcClose(sqlite3_file *pFile) {
                       &dbheader, sizeof(dbheader), &rrules, NULL);
   } while (status == STATUS_WRONG_VERSION);
   if (status != STATUS_OK) return SQLITE_IOERR;
+
   DPRINTF("RETURN close status is %d\n", status);
   return SQLITE_OK;
 }
@@ -833,8 +833,8 @@ static void cleanup_lockcb(
  * Locking.
  */
 static int rcLock(sqlite3_file *pFile, int eLock){
-  DPRINTF("lock %d (%p)\n", eLock, pFile);
   RcFile *p = (RcFile *)pFile;
+  DPRINTF("lock %d  (mytoken %d) (%p)\n", eLock, p->handle.token.digest[0] & 0xff, pFile);
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_LOCK;
   uint64_t tblid = p->handle.tblid;
@@ -952,8 +952,8 @@ static int rcLock(sqlite3_file *pFile, int eLock){
 
 
 static int rcUnlock(sqlite3_file *pFile, int eLock) {
-  DPRINTF("unlock to new level %d (%p)\n", eLock, pFile);
   RcFile *p = (RcFile *)pFile;
+  DPRINTF("unlock to new level %d (mytoken %d) (%p)\n", eLock, p->handle.token.digest[0] & 0xff, pFile);
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_LOCK;
   uint64_t tblid = p->handle.tblid;

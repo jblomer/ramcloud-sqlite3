@@ -5,8 +5,8 @@
 #include <assert.h>
 #include <stdio.h>
 
-#define ROWS 4
-#define THREADS 2
+#define ROWS 10
+#define THREADS 4
 
 
 char *dbname;
@@ -19,17 +19,17 @@ static void *mainThread(void *data) {
   assert(retval == 0);
 
   unsigned i;
+  sqlite3_stmt *sql_insert;
+  do {
+    retval = sqlite3_prepare(db, "INSERT INTO test (value) VALUES (:v)", -1, &sql_insert, NULL);
+  } while (retval == SQLITE_BUSY);
+  assert(retval == 0);
   for (i = 0; i < ROWS; ++i) {
     do {
       retval = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
     } while (retval == SQLITE_BUSY);
     printf("[%lu] begin transaction (%u)\n", threadno, i);
     //printf("retval is %d (error %s)\n", retval, sqlite3_errmsg(db));
-    assert(retval == 0);
-    sqlite3_stmt *sql_insert;
-    do {
-      retval = sqlite3_prepare(db, "INSERT INTO test (value) VALUES (:v)", -1, &sql_insert, NULL);
-    } while (retval == SQLITE_BUSY);
     assert(retval == 0);
     printf("[%lu] prepare stmt (%u)\n", threadno, i);
     retval = sqlite3_bind_int64(sql_insert, 1, i);
@@ -47,8 +47,11 @@ static void *mainThread(void *data) {
     printf("[%lu] COMMIT retval is %d (error %s) (i is %d)\n", threadno, retval, sqlite3_errmsg(db), i);
     assert(retval == 0);
   }
+  retval = sqlite3_finalize(sql_insert);
+  assert(retval == 0);
 
-  retval = sqlite3_close_v2(db);
+  retval = sqlite3_close(db);
+  printf("[%lu] CLOSE retval is %d (error %s) (i is %d)\n", threadno, retval, sqlite3_errmsg(db), i);
   assert(retval == 0);
 
   return NULL;
@@ -93,7 +96,7 @@ int main(int argc, char **argv) {
     assert(retval == 0);
   }
 
-  retval = sqlite3_close_v2(db);
+  retval = sqlite3_close(db);
   assert(retval == 0);
 
   retval = sqlite3_open_v2(dbname, &db, SQLITE_OPEN_READONLY, NULL);
@@ -107,8 +110,10 @@ int main(int argc, char **argv) {
   uint64_t sum = sqlite3_column_int64(sql_sum, 0);
   retval = sqlite3_reset(sql_sum);
   assert(retval == 0);
+  retval = sqlite3_finalize(sql_sum);
+  assert(retval == 0);
 
-  retval = sqlite3_close_v2(db);
+  retval = sqlite3_close(db);
   assert(retval == 0);
 
   sqlite3_rcvfs_disconnect(conn);
