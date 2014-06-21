@@ -465,6 +465,7 @@ static int rcDirectWrite(
         rrules.exists = 1;
       } else {
         rrules.givenVersion = version;
+        rrules.versionNeGiven = 1;
       }
       status = rc_write(rcs->client, p->handle.tblid,
                         &blockid, sizeof(blockid), block, this_blocksz,
@@ -539,6 +540,7 @@ static int rcClose(sqlite3_file *pFile) {
     dbheader.size = p->handle.size;
     memset(&dbheader.lease, 0, sizeof(dbheader.lease));
     rrules.givenVersion = version;
+    rrules.versionNeGiven = 1;
     status = rc_write(rcs->client, p->handle.tblid,
                       &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
                       &dbheader, sizeof(dbheader), &rrules, NULL);
@@ -709,6 +711,7 @@ static int rcSync(sqlite3_file *pFile, int flags){
     if (nbytes != sizeof(dbheader)) return SQLITE_CORRUPT;
     dbheader.size = p->handle.size;
     rrules.givenVersion = version;
+    rrules.versionNeGiven = 1;
     status = rc_write(rcs->client, p->handle.tblid,
                       &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
                       &dbheader, sizeof(dbheader), &rrules, NULL);
@@ -809,7 +812,7 @@ static void cleanup_lockcb(
   for (i = 0; i < *nLeasesOut; ) {
     int owned = is_owned(&leases[i], my_token);
     int valid_lease = is_locked(&leases[i]);
-    //if (owned && (leases[i].lease_type == PENDING_LOCK)) valid_lease = 0;
+    if (owned && (leases[i].lease_type == PENDING_LOCK)) valid_lease = 0;
     if (owned && (leases[i].lease_type > max_lease_type)) valid_lease = 0;
 
     if (!valid_lease) {
@@ -860,8 +863,12 @@ static int rcLock(sqlite3_file *pFile, int eLock){
 
     struct RejectRules rrules;
     memset(&rrules, 0, sizeof(rrules));
-    if (nleases == 0) rrules.exists = 1;
-    else rrules.givenVersion = lcbVersion;
+    if (nleases == 0) {
+      rrules.exists = 1;
+    } else {
+      rrules.givenVersion = lcbVersion;
+      rrules.versionNeGiven = 1;
+    }
 
     cleanup_lockcb(leases, &(p->handle.token), EXCLUSIVE_LOCK, nleases,
                    &nleases);
@@ -876,8 +883,8 @@ static int rcLock(sqlite3_file *pFile, int eLock){
       if (is_owned(&leases[i], &(p->handle.token))) {
         // Do I have already a lock of the required type or better?
         if (leases[i].lease_type >= eLock) {
-          result = SQLITE_OK;
-          break;
+          if (leases != leases_on_stack) sqlite3_free(leases);
+          return SQLITE_OK;
         }
       } else {
         // Not my locks
@@ -972,6 +979,7 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
     struct RejectRules rrules;
     memset(&rrules, 0, sizeof(rrules));
     rrules.givenVersion = lcbVersion;
+    rrules.versionNeGiven = 1;
 
     cleanup_lockcb(leases, &(p->handle.token), NO_LOCK, nleases, &nleases);
     if (eLock == SHARED_LOCK) {
