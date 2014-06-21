@@ -149,8 +149,8 @@
 #endif
 
 #ifndef DPRINTF
-# define DPRINTF(...) printf(__VA_ARGS__)
-//# define DPRINTF(...) (0)
+//# define DPRINTF(...) printf(__VA_ARGS__)
+# define DPRINTF(...) (0)
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
@@ -336,6 +336,12 @@ static char *sqlite3_strdup(const char *str) {
   if (!result) return NULL;
   memcpy(result, str, len);
   return result;
+}
+
+
+char *sqlite3_rcvfs_table_name(const char *path) {
+  SQLITE_RCVFS_DBID dbid = mk_dbid(path);
+  return sqlite3_strdup(dbid.table_name);  
 }
 
 
@@ -655,7 +661,7 @@ static int rcWrite(
  */
 // TODO
 static int rcTruncate(sqlite3_file *pFile, sqlite_int64 size){
-  DPRINTF("truncate\n");
+  printf("truncate\n");
 #if 0
   if( ftruncate(((DemoFile *)pFile)->fd, size) ) return SQLITE_IOERR_TRUNCATE;
 #endif

@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 #define ROWS 2
-#define THREADS 3
+#define THREADS 10
 
 
 char *dbname;
