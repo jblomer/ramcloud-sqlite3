@@ -5,8 +5,8 @@
 #include <assert.h>
 #include <stdio.h>
 
-#define ROWS 10
-#define THREADS 4
+#define ROWS 2
+#define THREADS 3
 
 
 char *dbname;

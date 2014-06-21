@@ -149,8 +149,8 @@
 #endif
 
 #ifndef DPRINTF
-//# define DPRINTF(...) printf(__VA_ARGS__)
-# define DPRINTF(...) (0)
+# define DPRINTF(...) printf(__VA_ARGS__)
+//# define DPRINTF(...) (0)
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
@@ -463,6 +463,7 @@ static int rcDirectWrite(
       if (new_block) {
         rrules.exists = 1;
       } else {
+        rrules.doesntExist = 1;
         rrules.givenVersion = version;
         rrules.versionNeGiven = 1;
       }
@@ -470,7 +471,8 @@ static int rcDirectWrite(
                         &blockid, sizeof(blockid), block, this_blocksz,
                         &rrules, NULL);
     } while ((status == STATUS_WRONG_VERSION) ||
-             (status == STATUS_OBJECT_EXISTS));
+             (status == STATUS_OBJECT_EXISTS) ||
+             (status == STATUS_OBJECT_DOESNT_EXIST));
     if (status != STATUS_OK) return SQLITE_IOERR_WRITE;
 
     remaining -= nbytes;
@@ -502,21 +504,20 @@ static int rcFlushBuffer(SQLITE_RCVFS_SESSION *rcs, RcFile *p){
 
 
 /**
- * Close a file.
+ * Close a database.  All changes must be already committed.
  */
 static int rcClose(sqlite3_file *pFile) {
-  DPRINTF("close\n");
-  int result;
   RcFile *p = (RcFile*)pFile;
-  SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
-  if (!rcs) return SQLITE_IOERR;
-  Status status;
-
-  result = rcFlushBuffer(rcs, p);
+  DPRINTF("close (my token %d)\n", p->handle.token.digest[0] & 0xff);
   sqlite3_free(p->aBuffer);
 
+  //int retval = p->base.pMethods->xUnlock(pFile, 0);
+  //assert(retval == SQLITE_OK);
+
   if (p->flags & SQLITE_OPEN_DELETEONCLOSE) {
-    status = rc_dropTable(rcs->client, p->handle.dbid.table_name);
+    SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
+    if (!rcs) return SQLITE_IOERR;
+    Status status = rc_dropTable(rcs->client, p->handle.dbid.table_name);
     switch (status) {
       case STATUS_OK:
         return SQLITE_OK;
@@ -525,28 +526,7 @@ static int rcClose(sqlite3_file *pFile) {
     }
   }
 
-  SQLITE_RCVFS_DBHEADER dbheader;
-  struct RejectRules rrules;
-  memset(&rrules, 0, sizeof(rrules));
-  do {  // Read-modify-write
-    uint64_t version;
-    uint32_t nbytes;
-    status = rc_read(rcs->client, p->handle.tblid,
-                     &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
-                     NULL, &version, &dbheader, sizeof(dbheader), &nbytes);
-    if (status != STATUS_OK) return SQLITE_IOERR;
-    if (nbytes != sizeof(dbheader)) return SQLITE_CORRUPT;
-    dbheader.size = p->handle.size;
-    memset(&dbheader.lease, 0, sizeof(dbheader.lease));
-    rrules.givenVersion = version;
-    rrules.versionNeGiven = 1;
-    status = rc_write(rcs->client, p->handle.tblid,
-                      &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
-                      &dbheader, sizeof(dbheader), &rrules, NULL);
-  } while (status == STATUS_WRONG_VERSION);
-  if (status != STATUS_OK) return SQLITE_IOERR;
-
-  DPRINTF("RETURN close status is %d\n", status);
+  DPRINTF("RETURN close\n");
   return SQLITE_OK;
 }
 
@@ -712,10 +692,12 @@ static int rcSync(sqlite3_file *pFile, int flags){
     dbheader.size = p->handle.size;
     rrules.givenVersion = version;
     rrules.versionNeGiven = 1;
+    rrules.doesntExist = 1;
     status = rc_write(rcs->client, p->handle.tblid,
                       &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
                       &dbheader, sizeof(dbheader), &rrules, NULL);
-  } while (status == STATUS_WRONG_VERSION);
+  } while ((status == STATUS_WRONG_VERSION) ||
+           (status == STATUS_OBJECT_DOESNT_EXIST));
   if (status != STATUS_OK) {
     DPRINTF("syncing failed %d\n", status);
     return SQLITE_IOERR_FSYNC;
@@ -772,6 +754,7 @@ static int get_lockcb(
   *nLeasesOut = 0;
   uint32_t nbytes = 0;
   int short_read = 0;
+  int leases_mallocd = 0;
   do {
     status =
       rc_read(rcs->client, tblid,
@@ -780,18 +763,22 @@ static int get_lockcb(
               *leases, nLeases*sizeof(SQLITE_RCVFS_LEASE), &nbytes);
     switch (status) {
       case STATUS_OBJECT_DOESNT_EXIST:
+        nbytes = 0;
       case STATUS_OK:
         *nLeasesOut = nbytes / sizeof(SQLITE_RCVFS_LEASE);
         if (*nLeasesOut >= nLeases) {
-          if (short_read) sqlite3_free(*leases);
+          if (leases_mallocd) sqlite3_free(*leases);
+          leases_mallocd = 1;
           short_read = 1;
           nLeases = *nLeasesOut + 1;
           *leases = (SQLITE_RCVFS_LEASE *)
             sqlite3_malloc(nLeases * sizeof(SQLITE_RCVFS_LEASE));
+        } else {
+          short_read = 0;
         }
         break;
       default:
-        if (short_read) sqlite3_free(*leases);
+        if (leases_mallocd) sqlite3_free(*leases);
         return SQLITE_IOERR_LOCK;
     }
   } while (short_read);
@@ -868,6 +855,7 @@ static int rcLock(sqlite3_file *pFile, int eLock){
     } else {
       rrules.givenVersion = lcbVersion;
       rrules.versionNeGiven = 1;
+      rrules.doesntExist = 1;
     }
 
     cleanup_lockcb(leases, &(p->handle.token), EXCLUSIVE_LOCK, nleases,
@@ -935,8 +923,8 @@ static int rcLock(sqlite3_file *pFile, int eLock){
         case STATUS_OK:
           break;
         case STATUS_OBJECT_EXISTS:
+        case STATUS_OBJECT_DOESNT_EXIST:
         case STATUS_WRONG_VERSION:
-          printf("LOCK WRONG VERSION\n");
           result = -1;
           break;
         default:
@@ -980,6 +968,7 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
     memset(&rrules, 0, sizeof(rrules));
     rrules.givenVersion = lcbVersion;
     rrules.versionNeGiven = 1;
+    rrules.doesntExist = 1;
 
     cleanup_lockcb(leases, &(p->handle.token), NO_LOCK, nleases, &nleases);
     if (eLock == SHARED_LOCK) {
@@ -1009,7 +998,7 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
         result = SQLITE_OK;
         break;
       case STATUS_WRONG_VERSION:
-        printf("UNLOCK WRONG VERSION\n");
+      case STATUS_OBJECT_DOESNT_EXIST:
         result = -1;
         break;
       default:
