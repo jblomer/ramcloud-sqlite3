@@ -5,13 +5,14 @@
 #include <assert.h>
 #include <stdio.h>
 
-#define ROWS 10
+#define ROWS 4
 #define THREADS 2
 
 
 char *dbname;
 
 static void *mainThread(void *data) {
+  uint64_t threadno = (uint64_t)(data);
   int retval;
   sqlite3 *db;
   retval = sqlite3_open_v2(dbname, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
@@ -22,24 +23,31 @@ static void *mainThread(void *data) {
     do {
       retval = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
     } while (retval == SQLITE_BUSY);
-    printf("retval is %d\n", retval);
+    printf("[%lu] begin transaction (%u)\n", threadno, i);
+    //printf("retval is %d (error %s)\n", retval, sqlite3_errmsg(db));
     assert(retval == 0);
     sqlite3_stmt *sql_insert;
-    retval = sqlite3_prepare(db, "INSERT INTO test (value) VALUES (:v)", -1, &sql_insert, NULL);
+    do {
+      retval = sqlite3_prepare(db, "INSERT INTO test (value) VALUES (:v)", -1, &sql_insert, NULL);
+    } while (retval == SQLITE_BUSY);
     assert(retval == 0);
+    printf("[%lu] prepare stmt (%u)\n", threadno, i);
     retval = sqlite3_bind_int64(sql_insert, 1, i);
     assert(retval == 0);
     do {
       retval = sqlite3_step(sql_insert);
     } while (retval == SQLITE_BUSY);
     assert(retval == SQLITE_DONE);
+    printf("[%lu] step (%u)\n", threadno, i);
     retval = sqlite3_reset(sql_insert);
     assert(retval == 0);
+    do {
+      retval = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    } while (retval == SQLITE_BUSY);
+    printf("[%lu] COMMIT retval is %d (error %s) (i is %d)\n", threadno, retval, sqlite3_errmsg(db), i);
+    assert(retval == 0);
   }
-  do {
-    retval = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-  } while (retval == SQLITE_BUSY);
-  assert(retval == 0);
+
   retval = sqlite3_close_v2(db);
   assert(retval == 0);
 
@@ -68,18 +76,16 @@ int main(int argc, char **argv) {
   assert(retval == 0);
   printf("file opened\n");
 
-  retval = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS test (value INTEGER);", NULL, NULL, NULL);
-  printf("retval is %d\n", retval);
-  assert(retval == 0);
-
-  retval = sqlite3_exec(db, "CREATE TEMP TABLE temp (value INTEGER);", NULL, NULL, NULL);
+  do {
+    retval = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS test (value INTEGER);", NULL, NULL, NULL);
+  } while (retval == SQLITE_BUSY);
   printf("retval is %d\n", retval);
   assert(retval == 0);
 
   pthread_t threads[THREADS];
-  unsigned i;
+  uint64_t i;
   for (i = 0; i < THREADS; ++i) {
-    retval = pthread_create(&threads[i], NULL, mainThread, NULL);
+    retval = pthread_create(&threads[i], NULL, mainThread, (void *)i);
     assert(retval == 0);
   }
   for (i = 0; i < THREADS; ++i) {
