@@ -138,6 +138,9 @@
 #include "CRamCloud.h"
 //#include <ramcloud/CRamCloud.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Size of the write buffer used by journal files in bytes.
 #ifndef SQLITE_RCVFS_BUFFERSZ
@@ -342,7 +345,7 @@ static char *sqlite3_strdup(const char *str) {
 
 char *sqlite3_rcvfs_table_name(const char *path) {
   SQLITE_RCVFS_DBID dbid = mk_dbid(path);
-  return sqlite3_strdup(dbid.table_name);  
+  return sqlite3_strdup(dbid.table_name);
 }
 
 
@@ -1427,5 +1430,9 @@ sqlite3_vfs *sqlite3_rcvfs(
   rcvfs.pAppData = conn;
   return &rcvfs;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* !defined(SQLITE_TEST) || SQLITE_OS_UNIX */
