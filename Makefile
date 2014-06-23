@@ -1,16 +1,19 @@
+INCLUDE_PATH = ../ramcloud/src
+LD_PATH = ../ramcloud/obj.master
+
 all: libsqlite3.a libvfs-ramcloud.a test test2 test3
 
 test3: test3.c vfs-ramcloud.h libvfs-ramcloud.a libsqlite3.a
-	gcc -pthread -std=c99 -O2 -g -Wall -o test3 test3.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
+	gcc -L$(LD_PATH) -I$(INCLUDE_PATH) -pthread -std=c99 -O2 -g -Wall -o test3 test3.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
 
 test2: test2.c vfs-ramcloud.h libvfs-ramcloud.a libsqlite3.a
-	gcc -pthread -std=c99 -O2 -g -Wall -o test2 test2.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
+	gcc -L$(LD_PATH) -I$(INCLUDE_PATH) -pthread -std=c99 -O2 -g -Wall -o test2 test2.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
 
 test: test.c vfs-ramcloud.h libvfs-ramcloud.a libsqlite3.a
-	gcc -pthread -std=c99 -O2 -g -Wall -o test test.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
+	gcc -L$(LD_PATH) -I$(INCLUDE_PATH) -pthread -std=c99 -O2 -g -Wall -o test test.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
 
 libvfs-ramcloud.a: vfs-ramcloud.c vfs-ramcloud.h md5.c md5.h
-	gcc -I. -fPIC -g -O2 -fno-strict-aliasing -fasynchronous-unwind-tables -fno-omit-frame-pointer -fno-optimize-sibling-calls -fvisibility=hidden -Wall -MT vfs-ramcloud.o -MD -MP -c -o vfs-ramcloud.o vfs-ramcloud.c
+	gcc -I. -I$(INCLUDE_PATH) -fPIC -g -O2 -fno-strict-aliasing -fasynchronous-unwind-tables -fno-omit-frame-pointer -fno-optimize-sibling-calls -fvisibility=hidden -Wall -MT vfs-ramcloud.o -MD -MP -c -o vfs-ramcloud.o vfs-ramcloud.c
 	gcc -I. -fPIC -g -O2 -fno-strict-aliasing -fasynchronous-unwind-tables -fno-omit-frame-pointer -fno-optimize-sibling-calls -fvisibility=hidden -Wall -MT md5.o -MD -MP -c -o md5.o md5.c
 	ar cru libvfs-ramcloud.a vfs-ramcloud.o md5.o
 	ranlib libvfs-ramcloud.a

@@ -135,7 +135,8 @@
 
 #include "md5.h"
 #include "sqlite3.h"
-#include <ramcloud/CRamCloud.h>
+#include "CRamCloud.h"
+//#include <ramcloud/CRamCloud.h>
 
 
 // Size of the write buffer used by journal files in bytes.
