@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
   //assert(vfs != NULL);
   //retval = sqlite3_vfs_register(vfs, 1);
   SQLITE_RCVFS_CONNECTION *conn =
-    sqlite3_rcvfs_connect("infrc:host=192.168.1.119,port=11100", "main");
+    sqlite3_rcvfs_connect("infrc:host=192.168.1.119,port=11100", "main", "sqlite3");
   assert(conn != NULL);
   retval = sqlite3_vfs_register(sqlite3_rcvfs("ramcloud", conn), 1);
   assert(retval == 0);
@@ -73,6 +73,13 @@ int main(int argc, char **argv) {
   sqlite3_rcvfs_disconnect(conn);
 
   printf("sum is %lu\n", sum);
+
+  SQLITE_RCVFS_STATS stats;
+  sqlite3_rcvfs_get_stats(&stats);
+  printf("nread: %lu\nnwrite: %lu\nnremove: %lu\nkB read: %lu\nkB write: %lu\n",
+         stats.nread, stats.nwrite, stats.nremove,
+         stats.szread/1024, stats.szwrite/1024);
+
   return 0;
 }
 

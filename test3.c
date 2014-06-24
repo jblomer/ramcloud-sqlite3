@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
   //assert(vfs != NULL);
   //retval = sqlite3_vfs_register(vfs, 1);
   SQLITE_RCVFS_CONNECTION *conn =
-    sqlite3_rcvfs_connect("zk:localhost:2181", "main");
+    sqlite3_rcvfs_connect("zk:localhost:2181", "main", "sqlite3");
   assert(conn != NULL);
   retval = sqlite3_vfs_register(sqlite3_rcvfs("ramcloud", conn), 1);
   assert(retval == 0);

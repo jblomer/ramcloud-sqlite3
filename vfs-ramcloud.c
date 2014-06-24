@@ -137,6 +137,7 @@
 #include "sqlite3.h"
 #include "CRamCloud.h"
 //#include <ramcloud/CRamCloud.h>
+#include "vfs-ramcloud-stats.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -153,8 +154,8 @@ extern "C" {
 #endif
 
 #ifndef DPRINTF
-//# define DPRINTF(...) printf(__VA_ARGS__)
-# define DPRINTF(...) (0)
+# define DPRINTF(...) printf(__VA_ARGS__)
+//# define DPRINTF(...) (0)
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
@@ -186,6 +187,8 @@ typedef struct sqlite3_rcvfs_connection SQLITE_RCVFS_CONNECTION;
 struct sqlite3_rcvfs_connection {
   char *locator;
   char *cluster_name;
+  char *table_name;
+  uint64_t tblid;
   pthread_key_t tls;  // Points to a SQLITE_RCVFS_SESSION
 };
 
@@ -195,6 +198,7 @@ struct sqlite3_rcvfs_connection {
  */
 typedef struct sqlite3_rcvfs_session SQLITE_RCVFS_SESSION;
 struct sqlite3_rcvfs_session {
+  SQLITE_RCVFS_CONNECTION *conn;
   struct rc_client *client;
 };
 static SQLITE_RCVFS_SESSION *get_rc_session(SQLITE_RCVFS_CONNECTION *conn) {
@@ -203,6 +207,7 @@ static SQLITE_RCVFS_SESSION *get_rc_session(SQLITE_RCVFS_CONNECTION *conn) {
     rcs = (SQLITE_RCVFS_SESSION *)sqlite3_malloc(sizeof(SQLITE_RCVFS_SESSION));
     if (!rcs) return NULL;
     memset(rcs, 0, sizeof(SQLITE_RCVFS_SESSION));
+    rcs->conn = conn;
     Status status = rc_connect(conn->locator, conn->cluster_name, &rcs->client);
     if (status != STATUS_OK) {
       sqlite3_free(rcs);
@@ -264,30 +269,29 @@ static int is_locked(const SQLITE_RCVFS_LEASE *lease) {
  */
 typedef struct sqlite3_rcvfs_dbid SQLITE_RCVFS_DBID;
 struct sqlite3_rcvfs_dbid {
-  char table_name[33];
+  unsigned char digest[16];
 };
 static SQLITE_RCVFS_DBID mk_dbid(const char *path) {
   SQLITE_RCVFS_DBID result;
   md5_state_t pms;
-  md5_byte_t digest[16];
   if (path) {
     md5_init(&pms);
     md5_append(&pms, (const md5_byte_t *)path, strlen(path));
-    md5_finish(&pms, digest);
+    md5_finish(&pms, result.digest);
   } else {
-    int retval = rcRandomness(NULL, 16, (char *)digest);
+    int retval = rcRandomness(NULL, 16, (char *)result.digest);
     assert(retval == 16);
   }
-  unsigned i;
+  /*unsigned i;
   for (i = 0; i < 16; ++i) {
-    char dgt1 = (unsigned)digest[i] / 16;
-    char dgt2 = (unsigned)digest[i] % 16;
+    char dgt1 = (unsigned)result.digest[i] / 16;
+    char dgt2 = (unsigned)result.digest[i] % 16;
     dgt1 += (dgt1 <= 9) ? '0' : 'a' - 10;
     dgt2 += (dgt2 <= 9) ? '0' : 'a' - 10;
     result.table_name[i*2] = dgt1;
     result.table_name[i*2+1] = dgt2;
   }
-  result.table_name[32] = '\0';
+  result.table_name[32] = '\0';*/
   return result;
 }
 typedef struct sqlite3_rcvfs_dbheader SQLITE_RCVFS_DBHEADER;
@@ -318,6 +322,11 @@ struct sqlite3_rcvfs_blockid {
 };
 SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_HEADERBLOCK = { (uint64_t)(-1) };
 SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_LCBLOCK     = { (uint64_t)(-2) };
+typedef struct sqlite3_rcvfs_blockkey SQLITE_RCVFS_BLOCKKEY;
+struct sqlite3_rcvfs_blockkey {
+  SQLITE_RCVFS_DBID dbid;
+  SQLITE_RCVFS_BLOCKID blockid;
+};
 
 
 typedef struct RcFile RcFile;
@@ -329,6 +338,37 @@ struct RcFile {
   int nBuffer;                    /* Valid bytes of data in zBuffer */
   sqlite3_int64 iBufferOfst;      /* Offset in file of zBuffer[0] */
 };
+
+//------------------------------------------------------------------------------
+
+typedef int64_t atomic_int64;
+
+static void inline __attribute__((used)) atomic_init64(atomic_int64 *a) {
+  *a = 0;
+}
+
+static int64_t inline __attribute__((used)) atomic_read64(atomic_int64 *a) {
+  return __sync_fetch_and_add(a, 0);
+}
+
+static void inline __attribute__((used)) atomic_inc64(atomic_int64 *a) {
+  (void) __sync_fetch_and_add(a, 1);
+}
+
+static int64_t inline __attribute__((used)) atomic_xadd64(atomic_int64 *a,
+                                                          int64_t offset)
+{
+  if (offset < 0)
+    return __sync_fetch_and_sub(a, -offset);
+  return __sync_fetch_and_add(a, offset);
+}
+
+
+atomic_int64 sqlite_rcvfs_nread = 0;
+atomic_int64 sqlite_rcvfs_nwrite = 0;
+atomic_int64 sqlite_rcvfs_nremove = 0;
+atomic_int64 sqlite_rcvfs_szread = 0;
+atomic_int64 sqlite_rcvfs_szwrite = 0;
 
 
 //------------------------------------------------------------------------------
@@ -343,16 +383,19 @@ static char *sqlite3_strdup(const char *str) {
 }
 
 
-char *sqlite3_rcvfs_table_name(const char *path) {
-  SQLITE_RCVFS_DBID dbid = mk_dbid(path);
-  return sqlite3_strdup(dbid.table_name);
-}
-
-
 static void sqlite3_rcvfs_tls_destructor(void *data) {
   SQLITE_RCVFS_SESSION *rcs = (SQLITE_RCVFS_SESSION *)data;
   if (rcs->client) rc_disconnect(rcs->client);
   sqlite3_free(rcs);
+}
+
+
+void sqlite3_rcvfs_get_stats(SQLITE_RCVFS_STATS *stats) {
+  stats->nread = atomic_read64(&sqlite_rcvfs_nread);
+  stats->nwrite = atomic_read64(&sqlite_rcvfs_nwrite);
+  stats->nremove = atomic_read64(&sqlite_rcvfs_nremove);
+  stats->szread = atomic_read64(&sqlite_rcvfs_szread);
+  stats->szwrite = atomic_read64(&sqlite_rcvfs_szwrite);
 }
 
 
@@ -361,7 +404,8 @@ static void sqlite3_rcvfs_tls_destructor(void *data) {
  */
 SQLITE_RCVFS_CONNECTION *sqlite3_rcvfs_connect(
   const char *locator,
-  const char *cluster_name
+  const char *cluster_name,
+  const char *table_name
 ){
   int retval;
   SQLITE_RCVFS_CONNECTION *conn = NULL;
@@ -373,12 +417,20 @@ SQLITE_RCVFS_CONNECTION *sqlite3_rcvfs_connect(
   memset(conn, 0, sizeof(SQLITE_RCVFS_CONNECTION));
   conn->locator = sqlite3_strdup(locator);
   conn->cluster_name = sqlite3_strdup(cluster_name);
-  if (!conn->locator && !conn->cluster_name) goto sqlite3_rcvfs_connect_fail;
+  conn->table_name = sqlite3_strdup(table_name);
+  if (!conn->locator || !conn->cluster_name || !conn->table_name)
+    goto sqlite3_rcvfs_connect_fail;
 
   rcs = (SQLITE_RCVFS_SESSION *)sqlite3_malloc(sizeof(SQLITE_RCVFS_SESSION));
   if (!rcs) goto sqlite3_rcvfs_connect_fail;
   memset(rcs, 0, sizeof(SQLITE_RCVFS_SESSION));
+  rcs->conn = conn;
   Status status = rc_connect(locator, cluster_name, &rcs->client);
+  if (status != STATUS_OK) goto sqlite3_rcvfs_connect_fail;
+
+  status = rc_createTable(rcs->client, conn->table_name, 5);
+  if (status != STATUS_OK) goto sqlite3_rcvfs_connect_fail;
+  status = rc_getTableId(rcs->client, conn->table_name, &(conn->tblid));
   if (status != STATUS_OK) goto sqlite3_rcvfs_connect_fail;
 
   retval = pthread_key_create(&conn->tls, sqlite3_rcvfs_tls_destructor);
@@ -395,6 +447,7 @@ SQLITE_RCVFS_CONNECTION *sqlite3_rcvfs_connect(
   if (conn) {
     if (conn->locator) sqlite3_free(conn->locator);
     if (conn->cluster_name) sqlite3_free(conn->cluster_name);
+    if (conn->table_name) sqlite3_free(conn->table_name);
     sqlite3_free(conn);
   }
   if (rcs) {
@@ -413,6 +466,7 @@ void sqlite3_rcvfs_disconnect(SQLITE_RCVFS_CONNECTION *conn) {
   pthread_key_delete(conn->tls);
   sqlite3_free(conn->locator);
   sqlite3_free(conn->cluster_name);
+  sqlite3_free(conn->table_name);
   sqlite3_free(conn);
 }
 
@@ -431,12 +485,13 @@ static int rcDirectWrite(
   unsigned iAmt,                /* Size of data to write in bytes */
   sqlite_int64 iOfst            /* File offset to write to */
 ){
-  //DPRINTF("write direct %d %lld\n", iAmt, iOfst);
+  DPRINTF("write direct %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   if (p->flags & SQLITE_OPEN_READONLY) return SQLITE_READONLY;
 
-  SQLITE_RCVFS_BLOCKID blockid;
-  blockid.blockno = iOfst / p->handle.blocksz;
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = p->handle.dbid;
+  block_key.blockid.blockno = iOfst / p->handle.blocksz;
 
   // Write block-wise
   unsigned char *block = (unsigned char *)alloca(p->handle.blocksz);
@@ -450,10 +505,12 @@ static int rcDirectWrite(
     Status status;
     do {
       uint64_t version;
-      uint32_t this_blocksz;
+      uint32_t this_blocksz = 0;
+      atomic_inc64(&sqlite_rcvfs_nread);
       status = rc_read(rcs->client, p->handle.tblid,
-                       &blockid, sizeof(blockid), NULL, &version,
+                       &block_key, sizeof(block_key), NULL, &version,
                        block, p->handle.blocksz, &this_blocksz);
+      atomic_xadd64(&sqlite_rcvfs_szread, this_blocksz);
       int new_block = 0;
       if (status == STATUS_OBJECT_DOESNT_EXIST) {
         new_block = 1;
@@ -477,9 +534,12 @@ static int rcDirectWrite(
         rrules.givenVersion = version;
         rrules.versionNeGiven = 1;
       }
+      atomic_inc64(&sqlite_rcvfs_nwrite);
       status = rc_write(rcs->client, p->handle.tblid,
-                        &blockid, sizeof(blockid), block, this_blocksz,
+                        &block_key, sizeof(block_key), block, this_blocksz,
                         &rrules, NULL);
+      if (status == STATUS_OK)
+        atomic_xadd64(&sqlite_rcvfs_szwrite, this_blocksz);
     } while ((status == STATUS_WRONG_VERSION) ||
              (status == STATUS_OBJECT_EXISTS) ||
              (status == STATUS_OBJECT_DOESNT_EXIST));
@@ -487,7 +547,7 @@ static int rcDirectWrite(
 
     remaining -= nbytes;
     pos_in_block = 0;
-    blockid.blockno++;
+    block_key.blockid.blockno++;
   }
 
   p->handle.size = (p->handle.size > iOfst + iAmt) ?
@@ -513,6 +573,32 @@ static int rcFlushBuffer(SQLITE_RCVFS_SESSION *rcs, RcFile *p){
 }
 
 
+// TODO: multi-operation
+static int rcDeleteInternal(
+  SQLITE_RCVFS_SESSION *rcs,
+  SQLITE_RCVFS_DBID dbid,
+  uint64_t blocksz,
+  uint64_t size
+){
+  uint64_t max_block = size / blocksz;
+  DPRINTF("delete internal %lu blocks\n", max_block);
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = dbid;
+  Status status;
+  uint64_t i;
+  for (i = (uint64_t)(-2); (i >= (uint64_t)(-2)) || (i <= max_block); ++i) {
+    block_key.blockid.blockno = i;
+    atomic_inc64(&sqlite_rcvfs_nremove);
+    status = rc_remove(rcs->client, rcs->conn->tblid,
+                       &block_key, sizeof(block_key),
+                       NULL, NULL);
+    if ((status != STATUS_OK) && (status != STATUS_OBJECT_DOESNT_EXIST))
+      return SQLITE_IOERR;
+  }
+  return SQLITE_OK;
+}
+
+
 /**
  * Close a database.  All changes must be already committed.
  */
@@ -528,13 +614,8 @@ static int rcClose(sqlite3_file *pFile) {
     SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
     printf("removing temp table\n");
     if (!rcs) return SQLITE_IOERR;
-    //Status status = rc_dropTable(rcs->client, p->handle.dbid.table_name);
-    //switch (status) {
-    //  case STATUS_OK:
-    //    return SQLITE_OK;
-    //  default:
-    //    return SQLITE_IOERR_DELETE;
-    //}
+    return rcDeleteInternal(rcs,
+                            p->handle.dbid, p->handle.blocksz, p->handle.size);
   }
 
   DPRINTF("RETURN close\n");
@@ -552,7 +633,7 @@ static int rcRead(
   sqlite_int64 iOfst
 ){
   //printf("R %d %lld\n", iAmt, iOfst);
-  //DPRINTF("read %d %lld\n", iAmt, iOfst);
+  DPRINTF("read %d %lld\n", iAmt, iOfst);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_READ;
@@ -568,16 +649,19 @@ static int rcRead(
 
   // Read block-wise
   unsigned char *block = (unsigned char *)alloca(p->handle.blocksz);
-  SQLITE_RCVFS_BLOCKID blockid;
-  blockid.blockno = iOfst / p->handle.blocksz;
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = p->handle.dbid;
+  block_key.blockid.blockno = iOfst / p->handle.blocksz;
   uint64_t written = 0;
   uint64_t remaining = iAmt;
   unsigned pos_in_block = iOfst % p->handle.blocksz;
   while (written < iAmt) {
-    uint32_t size_of_block;
+    uint32_t size_of_block = 0;
+    atomic_inc64(&sqlite_rcvfs_nread);
     Status status = rc_read(rcs->client, p->handle.tblid,
-                            &blockid, sizeof(blockid), NULL, NULL,
+                            &block_key, sizeof(block_key), NULL, NULL,
                             block, p->handle.blocksz, &size_of_block);
+    atomic_xadd64(&sqlite_rcvfs_szread, size_of_block);
     if ((status == STATUS_OBJECT_DOESNT_EXIST) &&
         ((iOfst == 0) || (written > 0)))
     {
@@ -591,7 +675,7 @@ static int rcRead(
     const unsigned nbytes =
       (remaining > size_of_block) ? size_of_block : remaining;
     memcpy((char *)zBuf + written, block + pos_in_block, nbytes);
-    blockid.blockno++;
+    block_key.blockid.blockno++;
     written += nbytes;
     remaining -= nbytes;
     pos_in_block = 0;
@@ -613,7 +697,7 @@ static int rcWrite(
   sqlite_int64 iOfst
 ){
   //printf("W %d %lld\n", iAmt, iOfst);
-  //DPRINTF("write %d %lld\n", iAmt, iOfst);
+  DPRINTF("write %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
@@ -691,22 +775,30 @@ static int rcSync(sqlite3_file *pFile, int flags){
   SQLITE_RCVFS_DBHEADER dbheader;
   struct RejectRules rrules;
   memset(&rrules, 0, sizeof(rrules));
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = p->handle.dbid;
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
   Status status;
   do {  // Read-modify-write
     uint64_t version;
-    uint32_t nbytes;
+    uint32_t nbytes = 0;
+    atomic_inc64(&sqlite_rcvfs_nread);
     status = rc_read(rcs->client, p->handle.tblid,
-                     &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
+                     &block_key, sizeof(block_key),
                      NULL, &version, &dbheader, sizeof(dbheader), &nbytes);
+    atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
     if (status != STATUS_OK) return SQLITE_IOERR_FSYNC;
     if (nbytes != sizeof(dbheader)) return SQLITE_CORRUPT;
     dbheader.size = p->handle.size;
     rrules.givenVersion = version;
     rrules.versionNeGiven = 1;
     rrules.doesntExist = 1;
+    atomic_inc64(&sqlite_rcvfs_nwrite);
     status = rc_write(rcs->client, p->handle.tblid,
-                      &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
+                      &block_key, sizeof(block_key),
                       &dbheader, sizeof(dbheader), &rrules, NULL);
+    if (status == STATUS_OK)
+      atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
   } while ((status == STATUS_WRONG_VERSION) ||
            (status == STATUS_OBJECT_DOESNT_EXIST));
   if (status != STATUS_OK) {
@@ -755,6 +847,7 @@ static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
  */
 static int get_lockcb(
   SQLITE_RCVFS_SESSION *rcs,
+  SQLITE_RCVFS_DBID dbid,
   uint64_t tblid,
   uint32_t nLeases,
   SQLITE_RCVFS_LEASE **leases,
@@ -766,12 +859,18 @@ static int get_lockcb(
   uint32_t nbytes = 0;
   int short_read = 0;
   int leases_mallocd = 0;
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = dbid;
+  block_key.blockid = SQLITE_RCVFS_LCBLOCK;
   do {
+    nbytes = 0;
+    atomic_inc64(&sqlite_rcvfs_nread);
     status =
       rc_read(rcs->client, tblid,
-              &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+              &block_key, sizeof(block_key),
               NULL, lcbVersion,
               *leases, nLeases*sizeof(SQLITE_RCVFS_LEASE), &nbytes);
+    atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
     switch (status) {
       case STATUS_OBJECT_DOESNT_EXIST:
         nbytes = 0;
@@ -855,7 +954,7 @@ static int rcLock(sqlite3_file *pFile, int eLock){
     uint32_t nleases;
     uint64_t lcbVersion;
     int retval;
-    retval = get_lockcb(rcs, tblid, SQLITE_RCVFS_STACKLEASES,
+    retval = get_lockcb(rcs, p->handle.dbid, tblid, SQLITE_RCVFS_STACKLEASES,
                         &leases, &nleases, &lcbVersion);
     if (retval != SQLITE_OK) return retval;
 
@@ -925,13 +1024,19 @@ static int rcLock(sqlite3_file *pFile, int eLock){
     if (new_lockcb) {
       DPRINTF("writing new lockcb of size %d (%p)\n", nleases+1, p);
       leases[nleases] = new_lease;
+      SQLITE_RCVFS_BLOCKKEY block_key;
+      block_key.dbid = p->handle.dbid;
+      block_key.blockid = SQLITE_RCVFS_LCBLOCK;
+      atomic_inc64(&sqlite_rcvfs_nwrite);
       Status status =
         rc_write(rcs->client, tblid,
-                 &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+                 &block_key, sizeof(block_key),
                  leases, (nleases+1) * sizeof(SQLITE_RCVFS_LEASE),
                  &rrules, NULL);
       switch (status) {
         case STATUS_OK:
+          atomic_xadd64(&sqlite_rcvfs_szwrite,
+                        (nleases+1) * sizeof(SQLITE_RCVFS_LEASE));
           break;
         case STATUS_OBJECT_EXISTS:
         case STATUS_OBJECT_DOESNT_EXIST:
@@ -969,7 +1074,7 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
     uint32_t nleases;
     uint64_t lcbVersion;
     int retval;
-    retval = get_lockcb(rcs, tblid, SQLITE_RCVFS_STACKLEASES,
+    retval = get_lockcb(rcs, p->handle.dbid, tblid, SQLITE_RCVFS_STACKLEASES,
                         &leases, &nleases, &lcbVersion);
     if (retval != SQLITE_OK) return retval;
     DPRINTF("retrieved %d leases (%p)\n", nleases, p);
@@ -993,16 +1098,24 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
     }
     DPRINTF("cleanup+mod: now %d leases (%p)\n", nleases, p);
 
+    SQLITE_RCVFS_BLOCKKEY block_key;
+    block_key.dbid = p->handle.dbid;
+    block_key.blockid = SQLITE_RCVFS_LCBLOCK;
     Status status;
     if (nleases == 0) {
+      atomic_inc64(&sqlite_rcvfs_nremove);
       status = rc_remove(rcs->client, tblid,
-                         &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+                         &block_key, sizeof(block_key),
                          &rrules, NULL);
     } else {
+      atomic_inc64(&sqlite_rcvfs_nwrite);
       status = rc_write(rcs->client, tblid,
-                        &SQLITE_RCVFS_LCBLOCK, sizeof(SQLITE_RCVFS_LCBLOCK),
+                        &block_key, sizeof(block_key),
                         leases, nleases * sizeof(SQLITE_RCVFS_LEASE),
                         &rrules, NULL);
+      if (status == STATUS_OK)
+        atomic_xadd64(&sqlite_rcvfs_szwrite, 
+                      nleases * sizeof(SQLITE_RCVFS_LEASE));
     }
     switch (status) {
       case STATUS_OK:
@@ -1036,7 +1149,7 @@ static int rcCheckReservedLock(sqlite3_file *pFile, int *pResOut){
   uint32_t nleases;
   uint64_t lcbVersion;
   int retval;
-  retval = get_lockcb(rcs, tblid, SQLITE_RCVFS_STACKLEASES,
+  retval = get_lockcb(rcs, p->handle.dbid, tblid, SQLITE_RCVFS_STACKLEASES,
                       &leases, &nleases, &lcbVersion);
   if (retval != SQLITE_OK) return retval;
 
@@ -1078,7 +1191,6 @@ static int rcDeviceCharacteristics(sqlite3_file *pFile){
  * file has been synced to disk before returning.  For RAMCloud, there is
  * no extra syncronization required.
  */
-static int rcSleep(sqlite3_vfs *pVfs, int nMicro);
 static int rcDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync) {
   DPRINTF("delete %s\n", zPath);
 
@@ -1086,34 +1198,23 @@ static int rcDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync) {
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(conn);
   if (!rcs) return SQLITE_IOERR_DELETE;
 
-//  // TODO: Remove me
-//  struct {
-//    uint64_t number;
-//    char more[64];
-//  } random_bits;
-//  rcRandomness(NULL, sizeof(random_bits), (void *)&random_bits);
-//  rcSleep(NULL, random_bits.number % (1000*1000*2));
-
   Status status;
-  SQLITE_RCVFS_DBID dbid = mk_dbid(zPath);
-  // TODO: Fix in RAMCloud
-  uint64_t tblid;
-  status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
-  if (status == STATUS_TABLE_DOESNT_EXIST) return SQLITE_OK;
+  SQLITE_RCVFS_DBHEADER dbheader;
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = mk_dbid(zPath);
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
+  uint32_t nbytes = 0;
+  atomic_inc64(&sqlite_rcvfs_nread);
+  status = rc_read(rcs->client, rcs->conn->tblid, &block_key, sizeof(block_key),
+                   NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
+  atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
+  if (status == STATUS_OBJECT_DOESNT_EXIST) return SQLITE_OK;
+  else if (status != STATUS_OK) return SQLITE_IOERR_DELETE;
 
-  printf("delete table %s\n", dbid.table_name);
-  //status = rc_dropTable(rcs->client, dbid.table_name);
-  //switch (status) {
- //   case STATUS_OK:
- //     // Fall through
- //   case STATUS_TABLE_DOESNT_EXIST:
- //     break;
- //   default:
- //     return SQLITE_IOERR_DELETE;
- // }
-
-  DPRINTF("delete Ok\n");
-  return SQLITE_OK;
+  int retval =
+    rcDeleteInternal(rcs, block_key.dbid, dbheader.blocksz, dbheader.size);
+  DPRINTF("delete returns %d\n", retval);
+  return retval;
 }
 
 #ifndef F_OK
@@ -1142,15 +1243,22 @@ static int rcAccess(
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(conn);
   if (!rcs) return SQLITE_IOERR;
 
-  uint64_t tblid;
-  SQLITE_RCVFS_DBID dbid = mk_dbid(zPath);
-  Status status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
+  Status status;
+  SQLITE_RCVFS_DBHEADER dbheader;
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = mk_dbid(zPath);
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
+  uint32_t nbytes = 0;
+  atomic_inc64(&sqlite_rcvfs_nread);
+  status = rc_read(rcs->client, rcs->conn->tblid, &block_key, sizeof(block_key),
+                   NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
+  atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
   switch (status) {
     case STATUS_OK:
       *pResOut = 1;
       DPRINTF("access yes\n");
       return SQLITE_OK;
-    case STATUS_TABLE_DOESNT_EXIST:
+    case STATUS_OBJECT_DOESNT_EXIST:
       DPRINTF("access no\n");
       *pResOut = 0;
       return SQLITE_OK;
@@ -1315,67 +1423,34 @@ static int rcOpen(
 
   // For temporary files (zName == 0) random name is used
   SQLITE_RCVFS_DBID dbid = mk_dbid(zName);
-  if (flags & SQLITE_OPEN_MAIN_JOURNAL) {
-    //assert(0);
-    dbid = mk_dbid(NULL);
-    memset(p, 0, sizeof(RcFile));
-    p->handle.token = mk_token();
-    p->handle.conn = conn;
-    p->handle.dbid = dbid;
-    p->handle.tblid = 0;
-    p->handle.size = 0;
-    p->handle.blocksz = 0;
-    p->flags = flags;
-    if (pOutFlags) *pOutFlags = flags;
-    p->base.pMethods = &rcio;
-    DPRINTF("all went fine\n");
-    printf("Open %s, internal name %s\n", zName, dbid.table_name);
-    return SQLITE_OK; 
-  }
-  printf("Open %s, internal name %s\n", zName, dbid.table_name);
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = dbid;
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
   SQLITE_RCVFS_DBHEADER dbheader;
   memset(&dbheader, 0, sizeof(dbheader));
 
   Status status;
   int new_db = 0;
-  uint64_t tblid;
-  status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
-  switch (status) {
-    case STATUS_OK:
-      if ((flags & SQLITE_OPEN_CREATE) && (flags & SQLITE_OPEN_EXCLUSIVE)) {
-        DPRINTF("exclusive open but table exists\n");
-        return SQLITE_CANTOPEN;
-      }
-      break;
-    case STATUS_TABLE_DOESNT_EXIST:
-      if (!(flags & SQLITE_OPEN_CREATE)) return SQLITE_CANTOPEN;
-      new_db = 1;
-      break;
-    default:
-      return SQLITE_CANTOPEN;
-  }
-
-  if (new_db) {
+  uint64_t tblid = conn->tblid;
+  if (flags & SQLITE_OPEN_CREATE) {
     DPRINTF("creating db\n");
     dbheader.version = 1;
     dbheader.blocksz = SQLITE_RCVFS_BLOCKSZ;
 
-    status = rc_createTable(rcs->client, dbid.table_name, 1);
-    if (status != STATUS_OK) return SQLITE_CANTOPEN;
-    status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
-    if (status != STATUS_OK) return SQLITE_CANTOPEN;
     struct RejectRules rrules;
     memset(&rrules, 0, sizeof(rrules));
     rrules.exists = 1;
+    atomic_inc64(&sqlite_rcvfs_nwrite);
     status = rc_write(rcs->client, tblid,
-                      &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
+                      &block_key, sizeof(block_key),
                       &dbheader, sizeof(dbheader), &rrules, NULL);
     switch (status) {
       case STATUS_OBJECT_EXISTS:
         if (flags & SQLITE_OPEN_EXCLUSIVE) return SQLITE_CANTOPEN;
-        new_db = 0;
         break;
       case STATUS_OK:
+        atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
+        new_db = 1;
         break;
       default:
         return SQLITE_CANTOPEN;
@@ -1384,14 +1459,12 @@ static int rcOpen(
 
   if (!new_db) {
     DPRINTF("reading header\n");
-    uint32_t nbytes;
-    do {
-      status = rc_read(rcs->client, tblid,
-                       &SQLITE_RCVFS_HEADERBLOCK, sizeof(SQLITE_RCVFS_HEADERBLOCK),
-                       NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
-    // TODO: we can hang here if the process creating the table died
-    // between creating the table and writing the header
-    } while (status == STATUS_OBJECT_DOESNT_EXIST);
+    uint32_t nbytes = 0;
+    atomic_inc64(&sqlite_rcvfs_nread);
+    status = rc_read(rcs->client, tblid,
+                     &block_key, sizeof(block_key),
+                     NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
+    atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
     if (status != STATUS_OK) return SQLITE_CANTOPEN;
   }
 
