@@ -154,8 +154,8 @@ extern "C" {
 #endif
 
 #ifndef DPRINTF
-# define DPRINTF(...) printf(__VA_ARGS__)
-//# define DPRINTF(...) (0)
+//# define DPRINTF(...) printf(__VA_ARGS__)
+# define DPRINTF(...) (0)
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
@@ -428,7 +428,7 @@ SQLITE_RCVFS_CONNECTION *sqlite3_rcvfs_connect(
   Status status = rc_connect(locator, cluster_name, &rcs->client);
   if (status != STATUS_OK) goto sqlite3_rcvfs_connect_fail;
 
-  status = rc_createTable(rcs->client, conn->table_name, 5);
+  status = rc_createTable(rcs->client, conn->table_name, 1);
   if (status != STATUS_OK) goto sqlite3_rcvfs_connect_fail;
   status = rc_getTableId(rcs->client, conn->table_name, &(conn->tblid));
   if (status != STATUS_OK) goto sqlite3_rcvfs_connect_fail;
