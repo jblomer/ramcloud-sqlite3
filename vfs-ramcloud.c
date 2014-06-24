@@ -526,14 +526,15 @@ static int rcClose(sqlite3_file *pFile) {
 
   if (p->flags & SQLITE_OPEN_DELETEONCLOSE) {
     SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
+    printf("removing temp table\n");
     if (!rcs) return SQLITE_IOERR;
-    Status status = rc_dropTable(rcs->client, p->handle.dbid.table_name);
-    switch (status) {
-      case STATUS_OK:
-        return SQLITE_OK;
-      default:
-        return SQLITE_IOERR_DELETE;
-    }
+    //Status status = rc_dropTable(rcs->client, p->handle.dbid.table_name);
+    //switch (status) {
+    //  case STATUS_OK:
+    //    return SQLITE_OK;
+    //  default:
+    //    return SQLITE_IOERR_DELETE;
+    //}
   }
 
   DPRINTF("RETURN close\n");
@@ -1100,15 +1101,16 @@ static int rcDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync) {
   status = rc_getTableId(rcs->client, dbid.table_name, &tblid);
   if (status == STATUS_TABLE_DOESNT_EXIST) return SQLITE_OK;
 
-  status = rc_dropTable(rcs->client, dbid.table_name);
-  switch (status) {
-    case STATUS_OK:
-      // Fall through
-    case STATUS_TABLE_DOESNT_EXIST:
-      break;
-    default:
-      return SQLITE_IOERR_DELETE;
-  }
+  printf("delete table %s\n", dbid.table_name);
+  //status = rc_dropTable(rcs->client, dbid.table_name);
+  //switch (status) {
+ //   case STATUS_OK:
+ //     // Fall through
+ //   case STATUS_TABLE_DOESNT_EXIST:
+ //     break;
+ //   default:
+ //     return SQLITE_IOERR_DELETE;
+ // }
 
   DPRINTF("delete Ok\n");
   return SQLITE_OK;
@@ -1313,6 +1315,24 @@ static int rcOpen(
 
   // For temporary files (zName == 0) random name is used
   SQLITE_RCVFS_DBID dbid = mk_dbid(zName);
+  if (flags & SQLITE_OPEN_MAIN_JOURNAL) {
+    //assert(0);
+    dbid = mk_dbid(NULL);
+    memset(p, 0, sizeof(RcFile));
+    p->handle.token = mk_token();
+    p->handle.conn = conn;
+    p->handle.dbid = dbid;
+    p->handle.tblid = 0;
+    p->handle.size = 0;
+    p->handle.blocksz = 0;
+    p->flags = flags;
+    if (pOutFlags) *pOutFlags = flags;
+    p->base.pMethods = &rcio;
+    DPRINTF("all went fine\n");
+    printf("Open %s, internal name %s\n", zName, dbid.table_name);
+    return SQLITE_OK; 
+  }
+  printf("Open %s, internal name %s\n", zName, dbid.table_name);
   SQLITE_RCVFS_DBHEADER dbheader;
   memset(&dbheader, 0, sizeof(dbheader));
 

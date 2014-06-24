@@ -20,15 +20,15 @@ int main(int argc, char **argv) {
   SQLITE_RCVFS_CONNECTION *conn =
     sqlite3_rcvfs_connect("infrc:host=192.168.1.119,port=11100", "main");
   assert(conn != NULL);
-  //retval = sqlite3_vfs_register(sqlite3_rcvfs("ramcloud", conn), 1);
-  //assert(retval == 0);
+  retval = sqlite3_vfs_register(sqlite3_rcvfs("ramcloud", conn), 1);
+  assert(retval == 0);
 
   sqlite3 *db;
   retval = sqlite3_open_v2(dbname, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
   assert(retval == 0);
   printf("file opened\n");
 
-  retval = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS test (value INTEGER);", NULL, NULL, NULL);
+  retval = sqlite3_exec(db, "PRAGMA main.journal_mode=OFF; CREATE TABLE IF NOT EXISTS test (value INTEGER);", NULL, NULL, NULL);
   printf("retval is %d\n", retval);
   assert(retval == 0);
 
