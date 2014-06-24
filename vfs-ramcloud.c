@@ -298,8 +298,6 @@ struct sqlite3_rcvfs_dbheader {
   int version;           // Currently 1
   uint64_t size;         // Size in bytes
   uint64_t blocksz;      // Size of the chunks in the block table
-  // non-zero objects owned by whoever has the lease token
-  SQLITE_RCVFS_LEASE lease;
 };
 typedef struct sqlite3_rcvfs_handle SQLITE_RCVFS_HANDLE;
 struct sqlite3_rcvfs_handle {
@@ -484,7 +482,7 @@ static int rcDirectWrite(
   unsigned iAmt,                /* Size of data to write in bytes */
   sqlite_int64 iOfst            /* File offset to write to */
 ){
-  //DPRINTF("write direct %d %lld\n", iAmt, iOfst);
+  DPRINTF("write direct %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   if (p->flags & SQLITE_OPEN_READONLY) return SQLITE_READONLY;
 
@@ -551,7 +549,7 @@ static int rcDirectWrite(
 
   p->handle.size = (p->handle.size > iOfst + iAmt) ?
                    p->handle.size : iOfst + iAmt;
-  //DPRINTF("direct write OK, file size %lu\n", p->handle.size);
+  DPRINTF("direct write OK, file size %lu\n", p->handle.size);
   return SQLITE_OK;
 }
 
@@ -580,6 +578,7 @@ static int rcDeleteInternal(
   uint64_t size
 ){
   uint64_t max_block = size / blocksz;
+  DPRINTF("delete internal %lu blocks\n", max_block);
   SQLITE_RCVFS_BLOCKKEY block_key;
   block_key.dbid = dbid;
   Status status;
@@ -630,7 +629,7 @@ static int rcRead(
   sqlite_int64 iOfst
 ){
   //printf("R %d %lld\n", iAmt, iOfst);
-  //DPRINTF("read %d %lld\n", iAmt, iOfst);
+  DPRINTF("read %d %lld\n", iAmt, iOfst);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_READ;
@@ -694,7 +693,7 @@ static int rcWrite(
   sqlite_int64 iOfst
 ){
   //printf("W %d %lld\n", iAmt, iOfst);
-  //DPRINTF("write %d %lld\n", iAmt, iOfst);
+  DPRINTF("write %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
@@ -770,38 +769,23 @@ static int rcSync(sqlite3_file *pFile, int flags){
 
   // Write modified file size
   SQLITE_RCVFS_DBHEADER dbheader;
-  struct RejectRules rrules;
-  memset(&rrules, 0, sizeof(rrules));
+  memset(&dbheader, 0, sizeof(dbheader));
+  dbheader.version = 1;
+  dbheader.size = p->handle.size;
+  dbheader.blocksz = p->handle.blocksz;
   SQLITE_RCVFS_BLOCKKEY block_key;
   block_key.dbid = p->handle.dbid;
   block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
   Status status;
-  do {  // Read-modify-write
-    uint64_t version;
-    uint32_t nbytes = 0;
-    atomic_inc64(&sqlite_rcvfs_nread);
-    status = rc_read(rcs->client, p->handle.tblid,
-                     &block_key, sizeof(block_key),
-                     NULL, &version, &dbheader, sizeof(dbheader), &nbytes);
-    atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
-    if (status != STATUS_OK) return SQLITE_IOERR_FSYNC;
-    if (nbytes != sizeof(dbheader)) return SQLITE_CORRUPT;
-    dbheader.size = p->handle.size;
-    rrules.givenVersion = version;
-    rrules.versionNeGiven = 1;
-    rrules.doesntExist = 1;
-    atomic_inc64(&sqlite_rcvfs_nwrite);
-    status = rc_write(rcs->client, p->handle.tblid,
-                      &block_key, sizeof(block_key),
-                      &dbheader, sizeof(dbheader), &rrules, NULL);
-    if (status == STATUS_OK)
-      atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
-  } while ((status == STATUS_WRONG_VERSION) ||
-           (status == STATUS_OBJECT_DOESNT_EXIST));
+  atomic_inc64(&sqlite_rcvfs_nwrite);
+  status = rc_write(rcs->client, p->handle.tblid,
+                    &block_key, sizeof(block_key),
+                    &dbheader, sizeof(dbheader), NULL, NULL);
   if (status != STATUS_OK) {
     DPRINTF("syncing failed %d\n", status);
     return SQLITE_IOERR_FSYNC;
   }
+  atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
   DPRINTF("syncing ok\n");
   return SQLITE_OK;
 }
@@ -1111,7 +1095,7 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
                         leases, nleases * sizeof(SQLITE_RCVFS_LEASE),
                         &rrules, NULL);
       if (status == STATUS_OK)
-        atomic_xadd64(&sqlite_rcvfs_szwrite, 
+        atomic_xadd64(&sqlite_rcvfs_szwrite,
                       nleases * sizeof(SQLITE_RCVFS_LEASE));
     }
     switch (status) {
