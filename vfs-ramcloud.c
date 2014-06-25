@@ -493,6 +493,7 @@ static int rcDirectWrite(
   block_key.blockid.blockno = iOfst / p->handle.blocksz;
 
   // Write block-wise
+  Status status;
   unsigned char *block = (unsigned char *)alloca(p->handle.blocksz);
   unsigned remaining = iAmt;
   unsigned pos_in_block = iOfst % p->handle.blocksz;
@@ -500,49 +501,29 @@ static int rcDirectWrite(
     memset(block, 0, p->handle.blocksz);
     unsigned free_in_block = p->handle.blocksz - pos_in_block;
     unsigned nbytes = (remaining > free_in_block) ? free_in_block : remaining;
-    // Read-modify-write
-    Status status;
-    do {
-      uint64_t version;
-      uint32_t this_blocksz = 0;
+    uint32_t this_blocksz = 0;
+
+    // Read only if this is not a full block
+    if ((pos_in_block != 0) || (remaining < p->handle.blocksz)) {
       atomic_inc64(&sqlite_rcvfs_nread);
       status = rc_read(rcs->client, p->handle.tblid,
-                       &block_key, sizeof(block_key), NULL, &version,
+                       &block_key, sizeof(block_key), NULL, NULL,
                        block, p->handle.blocksz, &this_blocksz);
       atomic_xadd64(&sqlite_rcvfs_szread, this_blocksz);
-      int new_block = 0;
-      if (status == STATUS_OBJECT_DOESNT_EXIST) {
-        new_block = 1;
-        this_blocksz = 0;
-      } else if (status != STATUS_OK) {
+      if ((status != STATUS_OK) && (status != STATUS_OBJECT_DOESNT_EXIST))
         return SQLITE_IOERR_WRITE;
-      }
+    }
 
-      memcpy(block + pos_in_block, (const char *)zBuf+(iAmt-remaining),
-             nbytes);
-      // The last block of a file can be enlarged
-      if ((pos_in_block + nbytes) > this_blocksz)
-        this_blocksz = pos_in_block + nbytes;
+    memcpy(block + pos_in_block, (const char *)zBuf+(iAmt-remaining), nbytes);
+    if ((pos_in_block + nbytes) > this_blocksz)
+      this_blocksz = pos_in_block + nbytes;
 
-      struct RejectRules rrules;
-      memset(&rrules, 0, sizeof(rrules));
-      if (new_block) {
-        rrules.exists = 1;
-      } else {
-        rrules.doesntExist = 1;
-        rrules.givenVersion = version;
-        rrules.versionNeGiven = 1;
-      }
-      atomic_inc64(&sqlite_rcvfs_nwrite);
-      status = rc_write(rcs->client, p->handle.tblid,
-                        &block_key, sizeof(block_key), block, this_blocksz,
-                        &rrules, NULL);
-      if (status == STATUS_OK)
-        atomic_xadd64(&sqlite_rcvfs_szwrite, this_blocksz);
-    } while ((status == STATUS_WRONG_VERSION) ||
-             (status == STATUS_OBJECT_EXISTS) ||
-             (status == STATUS_OBJECT_DOESNT_EXIST));
-    if (status != STATUS_OK) return SQLITE_IOERR_WRITE;
+    atomic_inc64(&sqlite_rcvfs_nwrite);
+    status = rc_write(rcs->client, p->handle.tblid,
+                      &block_key, sizeof(block_key), block, this_blocksz,
+                      NULL, NULL);
+    if (status == STATUS_OK) atomic_xadd64(&sqlite_rcvfs_szwrite, this_blocksz);
+    else return SQLITE_IOERR_WRITE;
 
     remaining -= nbytes;
     pos_in_block = 0;
