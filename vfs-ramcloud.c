@@ -578,8 +578,8 @@ static int rcDeleteInternal(
   uint64_t blocksz,
   uint64_t size
 ){
-  unsigned nbatch = 64;
   uint64_t max_block = size / blocksz;
+  unsigned nbatch = (max_block + 2) > 1024 ? 1024 : max_block + 2;
   DPRINTF("delete internal %lu blocks\n", max_block);
 
   SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
