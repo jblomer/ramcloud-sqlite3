@@ -76,8 +76,8 @@ int main(int argc, char **argv) {
 
   SQLITE_RCVFS_STATS stats;
   sqlite3_rcvfs_get_stats(&stats);
-  printf("nread: %lu\nnwrite: %lu\nnremove: %lu\nkB read: %lu\nkB write: %lu\n",
-         stats.nread, stats.nwrite, stats.nremove,
+  printf("nread: %lu\nnwrite: %lu\nnremove: %lu\nnmremove: %lu\nkB read: %lu\nkB write: %lu\n",
+         stats.nread, stats.nwrite, stats.nremove, stats.nmremove,
          stats.szread/1024, stats.szwrite/1024);
 
   return 0;
