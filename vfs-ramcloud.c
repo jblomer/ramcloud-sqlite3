@@ -1161,11 +1161,16 @@ static int rcFileControl(sqlite3_file *pFile, int op, void *pArg){
  * may return special values allowing SQLite to optimize file-system
  * access to some extent. But it is also safe to simply return 0.
  */
-static int rcSectorSize(sqlite3_file *pFile){
-  return 0;
+static int rcSectorSize(sqlite3_file *pFile) {
+  return 1024;
 }
-static int rcDeviceCharacteristics(sqlite3_file *pFile){
-  return 0;
+
+static int rcDeviceCharacteristics(sqlite3_file *pFile) {
+  return
+    SQLITE_IOCAP_ATOMIC1K |
+    SQLITE_IOCAP_SAFE_APPEND |
+    SQLITE_IOCAP_SEQUENTIAL |
+    SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN;
 }
 
 /**
