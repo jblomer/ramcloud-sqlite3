@@ -12,6 +12,7 @@ struct sqlite3_rcvfs_stats {
   uint64_t nread;
   uint64_t nwrite;
   uint64_t nremove;
+  uint64_t nmremove;
   uint64_t szread;
   uint64_t szwrite;
 };

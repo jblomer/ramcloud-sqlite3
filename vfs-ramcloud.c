@@ -365,6 +365,7 @@ static int64_t inline __attribute__((used)) atomic_xadd64(atomic_int64 *a,
 atomic_int64 sqlite_rcvfs_nread = 0;
 atomic_int64 sqlite_rcvfs_nwrite = 0;
 atomic_int64 sqlite_rcvfs_nremove = 0;
+atomic_int64 sqlite_rcvfs_nmremove = 0;
 atomic_int64 sqlite_rcvfs_szread = 0;
 atomic_int64 sqlite_rcvfs_szwrite = 0;
 
@@ -392,6 +393,7 @@ void sqlite3_rcvfs_get_stats(SQLITE_RCVFS_STATS *stats) {
   stats->nread = atomic_read64(&sqlite_rcvfs_nread);
   stats->nwrite = atomic_read64(&sqlite_rcvfs_nwrite);
   stats->nremove = atomic_read64(&sqlite_rcvfs_nremove);
+  stats->nmremove = atomic_read64(&sqlite_rcvfs_nmremove);
   stats->szread = atomic_read64(&sqlite_rcvfs_szread);
   stats->szwrite = atomic_read64(&sqlite_rcvfs_szwrite);
 }
@@ -571,27 +573,45 @@ static int rcFlushBuffer(SQLITE_RCVFS_SESSION *rcs, RcFile *p){
 }
 
 
-// TODO: multi-operation
 static int rcDeleteInternal(
   SQLITE_RCVFS_SESSION *rcs,
   SQLITE_RCVFS_DBID dbid,
   uint64_t blocksz,
   uint64_t size
 ){
+  unsigned nbatch = 64;
   uint64_t max_block = size / blocksz;
   DPRINTF("delete internal %lu blocks\n", max_block);
-  SQLITE_RCVFS_BLOCKKEY block_key;
-  block_key.dbid = dbid;
-  Status status;
-  uint64_t i;
-  for (i = (uint64_t)(-2); (i >= (uint64_t)(-2)) || (i <= max_block); ++i) {
-    block_key.blockid.blockno = i;
-    atomic_inc64(&sqlite_rcvfs_nremove);
-    status = rc_remove(rcs->client, rcs->conn->tblid,
-                       &block_key, sizeof(block_key),
-                       NULL, NULL);
-    if ((status != STATUS_OK) && (status != STATUS_OBJECT_DOESNT_EXIST))
-      return SQLITE_IOERR;
+
+  SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
+    alloca(nbatch * sizeof(SQLITE_RCVFS_BLOCKKEY));
+  unsigned char *mRemoveObjects = (unsigned char *)
+    alloca(nbatch * rc_szMultiRemoveObject);
+  void **pmRemoveObjects = (void **)alloca(nbatch * sizeof(void *));
+
+  uint64_t nremoved = 0;
+  while (nremoved < max_block + 2) {
+    unsigned i;
+    for (i = 0; (i < nbatch) && (nremoved < (max_block + 2)); ++i, ++nremoved) {
+      block_keys[i].dbid = dbid;
+      block_keys[i].blockid.blockno = nremoved - 2;
+      pmRemoveObjects[i] = mRemoveObjects + (i*rc_szMultiRemoveObject);
+      rc_multiRemoveCreate(rcs->conn->tblid,
+                           &(block_keys[i]), sizeof(SQLITE_RCVFS_BLOCKKEY),
+                           NULL,
+                           pmRemoveObjects[i]);
+      atomic_inc64(&sqlite_rcvfs_nremove);
+    }
+    atomic_inc64(&sqlite_rcvfs_nmremove);
+    rc_multiRemove(rcs->client, pmRemoveObjects, i);
+    unsigned j;
+    for (j = 0; j < i; ++j)
+      rc_multiOpDestroy(pmRemoveObjects[j], MULTI_OP_REMOVE);
+    for (j = 0; j < i; ++j) {
+      Status status = rc_multiOpStatus(pmRemoveObjects[j], MULTI_OP_REMOVE);
+      if ((status != STATUS_OK) && (status != STATUS_OBJECT_DOESNT_EXIST))
+        return SQLITE_IOERR;
+    }
   }
   return SQLITE_OK;
 }
