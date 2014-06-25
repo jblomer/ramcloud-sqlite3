@@ -599,7 +599,6 @@ static int rcDeleteInternal(
                            &(block_keys[i]), sizeof(SQLITE_RCVFS_BLOCKKEY),
                            NULL,
                            pmRemoveObjects[i]);
-      atomic_inc64(&sqlite_rcvfs_nremove);
     }
     atomic_inc64(&sqlite_rcvfs_nmremove);
     rc_multiRemove(rcs->client, pmRemoveObjects, i);
