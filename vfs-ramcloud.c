@@ -703,6 +703,7 @@ static int rcClose(sqlite3_file *pFile) {
   RcFile *p = (RcFile*)pFile;
   DPRINTF("close (my token %d)\n", p->handle.token.digest[0] & 0xff);
   sqlite3_free(p->aBuffer);
+  sqlite3_free(p->blockBuffer);
 
   //int retval = p->base.pMethods->xUnlock(pFile, 0);
   //assert(retval == SQLITE_OK);
