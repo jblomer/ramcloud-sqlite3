@@ -345,9 +345,6 @@ struct RcFile {
   SQLITE_RCVFS_HANDLE handle;
   int flags;                      /* Open flags */
   SQLITE_RCVFS_WBUFFER *blockBuffer;
-  char *aBuffer;                  /* Pointer to malloc'd buffer */
-  int nBuffer;                    /* Valid bytes of data in zBuffer */
-  sqlite3_int64 iBufferOfst;      /* Offset in file of zBuffer[0] */
 };
 
 //------------------------------------------------------------------------------
@@ -489,18 +486,18 @@ void sqlite3_rcvfs_disconnect(SQLITE_RCVFS_CONNECTION *conn) {
 //------------------------------------------------------------------------------
 
 
-static int rcWriteBuffer(
+static int rcFlushBlockBuffer(
   SQLITE_RCVFS_SESSION *rcs,
   RcFile *p
 ){
   DPRINTF("flush block buffer\n");
+  if (!p->blockBuffer) return SQLITE_OK;
 
   uint16_t N = SQLITE_RCVFS_WBUF_NBLOCKS;
   uint16_t szMultiOpWrite = rc_multiOpSizeOf(MULTI_OP_WRITE);
   SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
     alloca(N * sizeof(SQLITE_RCVFS_BLOCKKEY));
-  unsigned char *mWriteObjects = (unsigned char *)
-    alloca(N * szMultiOpWrite);
+  unsigned char *mWriteObjects = (unsigned char *) alloca(N * szMultiOpWrite);
   void **pmWriteObjects = (void **)alloca(N * sizeof(void *));
 
   unsigned num_requests = 0;
@@ -531,6 +528,7 @@ static int rcWriteBuffer(
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
 
+  // TODO!
   for (i = 0; i < num_requests; ++i)
     rc_multiOpDestroy(pmWriteObjects[i], MULTI_OP_WRITE);
   for (i = 0; i < num_requests; ++i) {
@@ -543,17 +541,16 @@ static int rcWriteBuffer(
 
 
 /**
- * Write directly to the file passed as the first argument. Even if the
- * file has a write-buffer (RcFile.aBuffer), ignore it.
+ * Write directly to the file passed as the first argument.
  */
-static int rcDirectWrite(
+static int rcBufferedWrite(
   SQLITE_RCVFS_SESSION *rcs,
   RcFile *p,                    /* File handle */
   const void *zBuf,             /* Buffer containing data to write */
   unsigned iAmt,                /* Size of data to write in bytes */
   sqlite_int64 iOfst            /* File offset to write to */
 ){
-  DPRINTF("write direct %d %lld\n", iAmt, iOfst);
+  DPRINTF("write into block buffer %d %lld\n", iAmt, iOfst);
   //hex_dump(zBuf, iAmt);
   if (p->flags & SQLITE_OPEN_READONLY) return SQLITE_READONLY;
 
@@ -593,7 +590,7 @@ static int rcDirectWrite(
     // If not already in buffer, occupy a new block.  Flush if necessary.
     if (!in_cache) {
       if (idx_free_block == -1) {
-        int retval = rcWriteBuffer(rcs, p);
+        int retval = rcFlushBlockBuffer(rcs, p);
         if (retval != SQLITE_OK) return retval;
         idx_free_block = 0;
       }
@@ -636,22 +633,6 @@ static int rcDirectWrite(
                    p->handle.size : iOfst + iAmt;
   DPRINTF("direct write OK, file size %lu\n", p->handle.size);
   return SQLITE_OK;
-}
-
-
-/**
- * Flush the contents of the RcFile.aBuffer buffer to RAMCloud. This is a
- * no-op if this particular file does not have a buffer (i.e. it is not
- * a journal file) or if the buffer is currently empty.
- */
-static int rcFlushBuffer(SQLITE_RCVFS_SESSION *rcs, RcFile *p){
-  //DPRINTF("flushing buffer\n");
-  int result = SQLITE_OK;
-  if (p->nBuffer) {
-    result = rcDirectWrite(rcs, p, p->aBuffer, p->nBuffer, p->iBufferOfst);
-    p->nBuffer = 0;
-  }
-  return result;
 }
 
 
@@ -705,7 +686,6 @@ static int rcDeleteInternal(
 static int rcClose(sqlite3_file *pFile) {
   RcFile *p = (RcFile*)pFile;
   DPRINTF("close (my token %d)\n", p->handle.token.digest[0] & 0xff);
-  sqlite3_free(p->aBuffer);
   sqlite3_free(p->blockBuffer);
 
   //int retval = p->base.pMethods->xUnlock(pFile, 0);
@@ -738,14 +718,6 @@ static int rcRead(
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_READ;
-
-  // Flush any data in the write buffer to disk in case this operation
-  // is trying to read data the file-region currently cached in the buffer.
-  // It would be possible to detect this case and possibly save an
-  // unnecessary write here, but in practice SQLite will rarely read from
-  // a journal file when there is data cached in the write-buffer.
-  int retval = rcFlushBuffer(rcs, p);
-  if (retval != SQLITE_OK) return retval;
   if (iOfst >= p->handle.size) return SQLITE_IOERR_SHORT_READ;
 
   // Read block-wise
@@ -806,7 +778,7 @@ static int rcRead(
 
 
 /**
- * Write data to a crash-file.
+ * Write data to a file.
  */
 static int rcWrite(
   sqlite3_file *pFile,
@@ -821,44 +793,7 @@ static int rcWrite(
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_WRITE;
 
-  if (p->aBuffer) {
-    char *z = (char *)zBuf;       /* Pointer to remaining data to write */
-    int n = iAmt;                 /* Number of bytes at z */
-    sqlite3_int64 i = iOfst;      /* File offset to write to */
-
-    while (n > 0) {
-      int nCopy;                  /* Number of bytes to copy into buffer */
-
-      // If the buffer is full, or if this data is not being written directly
-      // following the data already buffered, flush the buffer. Flushing
-      // the buffer is a no-op if it is empty.
-      if ((p->nBuffer == SQLITE_RCVFS_BUFFERSZ) ||
-          (p->iBufferOfst + p->nBuffer != i))
-      {
-        int retval = rcFlushBuffer(rcs, p);
-        if (retval != SQLITE_OK) return retval;
-      }
-      assert((p->nBuffer == 0) || (p->iBufferOfst + p->nBuffer == i));
-      p->iBufferOfst = i - p->nBuffer;
-
-      /* Copy as much data as possible into the buffer. */
-      nCopy = SQLITE_RCVFS_BUFFERSZ - p->nBuffer;
-      if (nCopy > n) {
-        nCopy = n;
-      }
-      memcpy(&p->aBuffer[p->nBuffer], z, nCopy);
-      p->nBuffer += nCopy;
-
-      n -= nCopy;
-      i += nCopy;
-      z += nCopy;
-    }
-  } else {
-    return rcDirectWrite(rcs, p, zBuf, iAmt, iOfst);
-  }
-
-  DPRINTF("RETURN write was fine\n");
-  return SQLITE_OK;
+  return rcBufferedWrite(rcs, p, zBuf, iAmt, iOfst);
 }
 
 
@@ -886,9 +821,7 @@ static int rcSync(sqlite3_file *pFile, int flags){
   if (!rcs) return SQLITE_IOERR_FSYNC;
 
   int retval;
-  retval = rcFlushBuffer(rcs, p);
-  if (retval != SQLITE_OK) return retval;
-  retval = rcWriteBuffer(rcs, p);
+  retval = rcFlushBlockBuffer(rcs, p);
   if (retval != SQLITE_OK) return retval;
 
   // Write modified file size
@@ -923,13 +856,6 @@ static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR;
-
-  // Flush the contents of the buffer to disk. As with the flush in the
-  // rcRead() method, it would be possible to avoid this and save a write
-  // here and there. But in practice this comes up so infrequently it is
-  // not worth the trouble.
-  int retval = rcFlushBuffer(rcs, p);
-  if (retval != SQLITE_OK) return retval;
 
   *pSize = p->handle.size;
   DPRINTF("return file size %lld\n", *pSize);
@@ -1591,11 +1517,6 @@ static int rcOpen(
   unsigned i;
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
-  if (flags & SQLITE_OPEN_MAIN_JOURNAL) {
-    p->aBuffer = (char *)sqlite3_malloc(SQLITE_RCVFS_BUFFERSZ);
-    if (!p->aBuffer)
-      return SQLITE_NOMEM;
-  }
   if (pOutFlags) *pOutFlags = flags;
   p->base.pMethods = &rcio;
   DPRINTF("all went fine\n");
