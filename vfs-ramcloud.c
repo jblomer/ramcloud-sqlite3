@@ -496,10 +496,11 @@ static int rcWriteBuffer(
   DPRINTF("flush block buffer\n");
 
   uint16_t N = SQLITE_RCVFS_WBUF_NBLOCKS;
+  uint16_t szMultiOpWrite = rc_multiOpSizeOf(MULTI_OP_WRITE);
   SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
     alloca(N * sizeof(SQLITE_RCVFS_BLOCKKEY));
   unsigned char *mWriteObjects = (unsigned char *)
-    alloca(N * rc_szMultiWriteObject);
+    alloca(N * szMultiOpWrite);
   void **pmWriteObjects = (void **)alloca(N * sizeof(void *));
 
   unsigned num_requests = 0;
@@ -511,7 +512,7 @@ static int rcWriteBuffer(
       block_keys[num_requests].dbid = p->handle.dbid;
       block_keys[num_requests].blockid = p->blockBuffer->blockIds[i];
       pmWriteObjects[num_requests] =
-        mWriteObjects + (num_requests*rc_szMultiWriteObject);
+        mWriteObjects + (num_requests * szMultiOpWrite);
       rc_multiWriteCreate(rcs->conn->tblid,
                           &(block_keys[num_requests]), sizeof(SQLITE_RCVFS_BLOCKKEY),
                           p->blockBuffer->buf[num_requests],
@@ -662,12 +663,13 @@ static int rcDeleteInternal(
 ){
   uint64_t max_block = size / blocksz;
   unsigned nbatch = (max_block + 2) > 1024 ? 1024 : max_block + 2;
+  uint16_t szMultiOpRemove = rc_multiOpSizeOf(MULTI_OP_REMOVE);
   DPRINTF("delete internal %lu blocks\n", max_block);
 
   SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
     alloca(nbatch * sizeof(SQLITE_RCVFS_BLOCKKEY));
   unsigned char *mRemoveObjects = (unsigned char *)
-    alloca(nbatch * rc_szMultiRemoveObject);
+    alloca(nbatch * szMultiOpRemove);
   void **pmRemoveObjects = (void **)alloca(nbatch * sizeof(void *));
 
   uint64_t nremoved = 0;
@@ -676,7 +678,7 @@ static int rcDeleteInternal(
     for (i = 0; (i < nbatch) && (nremoved < (max_block + 2)); ++i, ++nremoved) {
       block_keys[i].dbid = dbid;
       block_keys[i].blockid.blockno = nremoved - 2;
-      pmRemoveObjects[i] = mRemoveObjects + (i*rc_szMultiRemoveObject);
+      pmRemoveObjects[i] = mRemoveObjects + (i * szMultiOpRemove);
       rc_multiRemoveCreate(rcs->conn->tblid,
                            &(block_keys[i]), sizeof(SQLITE_RCVFS_BLOCKKEY),
                            NULL,
