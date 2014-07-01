@@ -527,15 +527,14 @@ static int rcFlushBlockBuffer(
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
 
-  // TODO!
-  for (i = 0; i < num_requests; ++i)
-    rc_multiOpDestroy(pmWriteObjects[i], MULTI_OP_WRITE);
+  int result = SQLITE_OK;
   for (i = 0; i < num_requests; ++i) {
     Status status = rc_multiOpStatus(pmWriteObjects[i], MULTI_OP_WRITE);
-    if (status != STATUS_OK) return SQLITE_IOERR;
+    if (status != STATUS_OK) result = SQLITE_IOERR;
+    rc_multiOpDestroy(pmWriteObjects[i], MULTI_OP_WRITE);
   }
 
-  return SQLITE_OK;
+  return result;
 }
 
 
@@ -1215,6 +1214,7 @@ static int rcDeviceCharacteristics(sqlite3_file *pFile) {
   return
     SQLITE_IOCAP_ATOMIC1K |
     SQLITE_IOCAP_SAFE_APPEND |
+    SQLITE_IOCAP_SEQUENTIAL |
     SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN;
 }
 
