@@ -325,6 +325,9 @@ struct sqlite3_rcvfs_blockid {
 SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_HEADERBLOCK  = { (uint64_t)(-1) };
 SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_LCBLOCK      = { (uint64_t)(-2) };
 SQLITE_RCVFS_BLOCKID SQLITE_RCVFS_INVALIDBLOCK = { (uint64_t)(-4) };
+static inline int isInvalidBlock(SQLITE_RCVFS_BLOCKID *blockid) {
+  return blockid->blockno == SQLITE_RCVFS_INVALIDBLOCK.blockno;
+}
 typedef struct sqlite3_rcvfs_blockkey SQLITE_RCVFS_BLOCKKEY;
 struct sqlite3_rcvfs_blockkey {
   SQLITE_RCVFS_DBID dbid;
@@ -337,6 +340,11 @@ struct sqlite3_rcvfs_wbuffer {
   uint16_t blockSizes[SQLITE_RCVFS_WBUF_NBLOCKS];
   unsigned char buf[SQLITE_RCVFS_WBUF_NBLOCKS][SQLITE_RCVFS_BLOCKSZ];
 };
+static inline void clearBufferBlock(SQLITE_RCVFS_WBUFFER *buf, unsigned idx) {
+  buf->blockIds[idx] = SQLITE_RCVFS_INVALIDBLOCK;
+  buf->blockSizes[idx] = 0;
+  memset(buf->buf[idx], 0, SQLITE_RCVFS_BLOCKSZ);
+}
 
 
 typedef struct RcFile RcFile;
@@ -345,6 +353,7 @@ struct RcFile {
   SQLITE_RCVFS_HANDLE handle;
   int flags;                      /* Open flags */
   SQLITE_RCVFS_WBUFFER *blockBuffer;
+  uint64_t permanentSize;
 };
 
 //------------------------------------------------------------------------------
@@ -503,9 +512,7 @@ static int rcFlushBlockBuffer(
   unsigned num_requests = 0;
   unsigned i;
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i) {
-    if (p->blockBuffer->blockIds[i].blockno !=
-        SQLITE_RCVFS_INVALIDBLOCK.blockno)
-    {
+    if (!isInvalidBlock(&(p->blockBuffer->blockIds[i]))) {
       block_keys[num_requests].dbid = p->handle.dbid;
       block_keys[num_requests].blockid = p->blockBuffer->blockIds[i];
       pmWriteObjects[num_requests] =
@@ -526,17 +533,16 @@ static int rcFlushBlockBuffer(
   rc_multiWrite(rcs->client, pmWriteObjects, num_requests);
   memset(p->blockBuffer, 0, sizeof(p->blockBuffer));
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
-    p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
+    clearBufferBlock(p->blockBuffer, i);
 
-  // TODO!
-  for (i = 0; i < num_requests; ++i)
-    rc_multiOpDestroy(pmWriteObjects[i], MULTI_OP_WRITE);
+  int result = SQLITE_OK;
   for (i = 0; i < num_requests; ++i) {
     Status status = rc_multiOpStatus(pmWriteObjects[i], MULTI_OP_WRITE);
-    if (status != STATUS_OK) return SQLITE_IOERR;
+    if (status != STATUS_OK) result = SQLITE_IOERR;
+    rc_multiOpDestroy(pmWriteObjects[i], MULTI_OP_WRITE);
   }
 
-  return SQLITE_OK;
+  return result;
 }
 
 
@@ -567,6 +573,7 @@ static int rcBufferedWrite(
     block = NULL;
     unsigned free_in_block = p->handle.blocksz - pos_in_block;
     unsigned nbytes = (remaining > free_in_block) ? free_in_block : remaining;
+    uint64_t absolute_offset = iOfst + iAmt - remaining;
     uint32_t this_blocksz = 0;
 
     // Check in buffer
@@ -576,12 +583,11 @@ static int rcBufferedWrite(
     for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i) {
       if (p->blockBuffer->blockIds[i].blockno == block_key.blockid.blockno) {
         block = p->blockBuffer->buf[i];
-        this_blocksz =  p->blockBuffer->blockSizes[i];
+        this_blocksz = p->blockBuffer->blockSizes[i];
         in_cache = 1;
         break;
       } else if ((idx_free_block == -1) &&
-                 (p->blockBuffer->blockIds[i].blockno ==
-                  SQLITE_RCVFS_INVALIDBLOCK.blockno))
+                 isInvalidBlock(&(p->blockBuffer->blockIds[i])))
       {
         idx_free_block = i;
       }
@@ -596,12 +602,14 @@ static int rcBufferedWrite(
       }
       block = p->blockBuffer->buf[idx_free_block];
       p->blockBuffer->blockIds[idx_free_block] = block_key.blockid;
-      if ((pos_in_block + remaining) > p->blockBuffer->blockSizes[idx_free_block])
+      if ((pos_in_block + nbytes) > p->blockBuffer->blockSizes[idx_free_block])
         p->blockBuffer->blockSizes[idx_free_block] = pos_in_block + nbytes;
     }
 
-    // Read only if this is not a full block and not in cache
+    // Read only if this is not a full block and not in cache and if there
+    // is a block for it in RAMCloud
     if (!in_cache &&
+        (absolute_offset < p->permanentSize) &&
         ((pos_in_block != 0) || (remaining < p->handle.blocksz)))
     {
       atomic_inc64(&sqlite_rcvfs_nread);
@@ -617,13 +625,6 @@ static int rcBufferedWrite(
     if ((pos_in_block + nbytes) > this_blocksz)
       this_blocksz = pos_in_block + nbytes;
 
-    /*atomic_inc64(&sqlite_rcvfs_nwrite);
-    status = rc_write(rcs->client, p->handle.tblid,
-                      &block_key, sizeof(block_key), block, this_blocksz,
-                      NULL, NULL);
-    if (status == STATUS_OK) atomic_xadd64(&sqlite_rcvfs_szwrite, this_blocksz);
-    else return SQLITE_IOERR_WRITE;*/
-
     remaining -= nbytes;
     pos_in_block = 0;
     block_key.blockid.blockno++;
@@ -631,7 +632,7 @@ static int rcBufferedWrite(
 
   p->handle.size = (p->handle.size > iOfst + iAmt) ?
                    p->handle.size : iOfst + iAmt;
-  DPRINTF("direct write OK, file size %lu\n", p->handle.size);
+  DPRINTF("buffered write OK, file size %lu\n", p->handle.size);
   return SQLITE_OK;
 }
 
@@ -696,7 +697,7 @@ static int rcClose(sqlite3_file *pFile) {
     printf("removing temp table\n");
     if (!rcs) return SQLITE_IOERR;
     return rcDeleteInternal(rcs,
-                            p->handle.dbid, p->handle.blocksz, p->handle.size);
+                            p->handle.dbid, p->handle.blocksz, p->permanentSize);
   }
 
   DPRINTF("RETURN close\n");
@@ -843,6 +844,7 @@ static int rcSync(sqlite3_file *pFile, int flags){
     return SQLITE_IOERR_FSYNC;
   }
   atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
+  p->permanentSize = p->handle.size;
   DPRINTF("syncing ok\n");
   return SQLITE_OK;
 }
@@ -1217,6 +1219,7 @@ static int rcDeviceCharacteristics(sqlite3_file *pFile) {
   return
     SQLITE_IOCAP_ATOMIC1K |
     SQLITE_IOCAP_SAFE_APPEND |
+    SQLITE_IOCAP_SEQUENTIAL |
     SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN;
 }
 
@@ -1511,12 +1514,12 @@ static int rcOpen(
   p->handle.size = dbheader.size;
   p->handle.blocksz = dbheader.blocksz;
   p->flags = flags;
+  p->permanentSize = p->handle.size;
   p->blockBuffer = (SQLITE_RCVFS_WBUFFER *)
     sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
-  memset(p->blockBuffer, 0, sizeof(SQLITE_RCVFS_WBUFFER));
   unsigned i;
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
-    p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
+    clearBufferBlock(p->blockBuffer, i);
   if (pOutFlags) *pOutFlags = flags;
   p->base.pMethods = &rcio;
   DPRINTF("all went fine\n");
