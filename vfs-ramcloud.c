@@ -488,18 +488,82 @@ void sqlite3_rcvfs_disconnect(SQLITE_RCVFS_CONNECTION *conn) {
 //------------------------------------------------------------------------------
 
 
+/**
+ * Write directly to the file passed as the first argument. Even if the
+ * file has a write-buffer (RcFile.aBuffer), ignore it.
+ */
+static int rcDirectWrite(
+  SQLITE_RCVFS_SESSION *rcs,
+  RcFile *p,                    /* File handle */
+  const void *zBuf,             /* Buffer containing data to write */
+  unsigned iAmt,                /* Size of data to write in bytes */
+  sqlite_int64 iOfst            /* File offset to write to */
+){
+  DPRINTF("write direct %d %lld\n", iAmt, iOfst);
+  //hex_dump(zBuf, iAmt);
+  if (p->flags & SQLITE_OPEN_READONLY) return SQLITE_READONLY;
+
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = p->handle.dbid;
+  block_key.blockid.blockno = iOfst / p->handle.blocksz;
+
+  // Write block-wise
+  Status status;
+  unsigned char *block = (unsigned char *)alloca(p->handle.blocksz);
+  unsigned remaining = iAmt;
+  unsigned pos_in_block = iOfst % p->handle.blocksz;
+  while (remaining > 0) {
+    memset(block, 0, p->handle.blocksz);
+    unsigned free_in_block = p->handle.blocksz - pos_in_block;
+    unsigned nbytes = (remaining > free_in_block) ? free_in_block : remaining;
+    uint32_t this_blocksz = 0;
+
+    // Read only if this is not a full block
+    if ((pos_in_block != 0) || (remaining < p->handle.blocksz)) {
+      atomic_inc64(&sqlite_rcvfs_nread);
+      status = rc_read(rcs->client, p->handle.tblid,
+                       &block_key, sizeof(block_key), NULL, NULL,
+                       block, p->handle.blocksz, &this_blocksz);
+      atomic_xadd64(&sqlite_rcvfs_szread, this_blocksz);
+      if ((status != STATUS_OK) && (status != STATUS_OBJECT_DOESNT_EXIST))
+        return SQLITE_IOERR_WRITE;
+    }
+
+    memcpy(block + pos_in_block, (const char *)zBuf+(iAmt-remaining), nbytes);
+    if ((pos_in_block + nbytes) > this_blocksz)
+      this_blocksz = pos_in_block + nbytes;
+
+    atomic_inc64(&sqlite_rcvfs_nwrite);
+    status = rc_write(rcs->client, p->handle.tblid,
+                      &block_key, sizeof(block_key), block, this_blocksz,
+                      NULL, NULL);
+    if (status == STATUS_OK) atomic_xadd64(&sqlite_rcvfs_szwrite, this_blocksz);
+    else return SQLITE_IOERR_WRITE;
+
+    remaining -= nbytes;
+    pos_in_block = 0;
+    block_key.blockid.blockno++;
+  }
+
+  p->handle.size = (p->handle.size > iOfst + iAmt) ?
+                   p->handle.size : iOfst + iAmt;
+  DPRINTF("direct write OK, file size %lu\n", p->handle.size);
+  return SQLITE_OK;
+}
+
+
 static int rcWriteBuffer(
   SQLITE_RCVFS_SESSION *rcs,
   RcFile *p
 ){
   DPRINTF("flush block buffer\n");
+  if (!p->blockBuffer) return SQLITE_OK;
 
   uint16_t N = SQLITE_RCVFS_WBUF_NBLOCKS;
   uint16_t szMultiOpWrite = rc_multiOpSizeOf(MULTI_OP_WRITE);
   SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
     alloca(N * sizeof(SQLITE_RCVFS_BLOCKKEY));
-  unsigned char *mWriteObjects = (unsigned char *)
-    alloca(N * szMultiOpWrite);
+  unsigned char *mWriteObjects = (unsigned char *) alloca(N * szMultiOpWrite);
   void **pmWriteObjects = (void **)alloca(N * sizeof(void *));
 
   unsigned num_requests = 0;
@@ -530,6 +594,7 @@ static int rcWriteBuffer(
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
 
+  // TODO!
   for (i = 0; i < num_requests; ++i)
     rc_multiOpDestroy(pmWriteObjects[i], MULTI_OP_WRITE);
   for (i = 0; i < num_requests; ++i) {
@@ -545,7 +610,7 @@ static int rcWriteBuffer(
  * Write directly to the file passed as the first argument. Even if the
  * file has a write-buffer (RcFile.aBuffer), ignore it.
  */
-static int rcDirectWrite(
+static int rcBufferedWrite(
   SQLITE_RCVFS_SESSION *rcs,
   RcFile *p,                    /* File handle */
   const void *zBuf,             /* Buffer containing data to write */
@@ -852,7 +917,7 @@ static int rcWrite(
       z += nCopy;
     }
   } else {
-    return rcDirectWrite(rcs, p, zBuf, iAmt, iOfst);
+    return rcBufferedWrite(rcs, p, zBuf, iAmt, iOfst);
   }
 
   DPRINTF("RETURN write was fine\n");
@@ -1583,16 +1648,17 @@ static int rcOpen(
   p->handle.size = dbheader.size;
   p->handle.blocksz = dbheader.blocksz;
   p->flags = flags;
-  p->blockBuffer = (SQLITE_RCVFS_WBUFFER *)
-    sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
-  memset(p->blockBuffer, 0, sizeof(SQLITE_RCVFS_WBUFFER));
-  unsigned i;
-  for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
-    p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
   if (flags & SQLITE_OPEN_MAIN_JOURNAL) {
     p->aBuffer = (char *)sqlite3_malloc(SQLITE_RCVFS_BUFFERSZ);
     if (!p->aBuffer)
       return SQLITE_NOMEM;
+  } else {
+    p->blockBuffer = (SQLITE_RCVFS_WBUFFER *)
+      sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
+    memset(p->blockBuffer, 0, sizeof(SQLITE_RCVFS_WBUFFER));
+    unsigned i;
+    for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
+      p->blockBuffer->blockIds[i] = SQLITE_RCVFS_INVALIDBLOCK;
   }
   if (pOutFlags) *pOutFlags = flags;
   p->base.pMethods = &rcio;
