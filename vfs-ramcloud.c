@@ -1,117 +1,3 @@
-/*
-** 2010 April 7
-**
-** The author disclaims copyright to this source code.  In place of
-** a legal notice, here is a blessing:
-**
-**    May you do good and not evil.
-**    May you find forgiveness for yourself and forgive others.
-**    May you share freely, never taking more than you give.
-**
-*************************************************************************
-**
-** This file implements an example of a simple VFS implementation that
-** omits complex features often not required or not possible on embedded
-** platforms.  Code is included to buffer writes to the journal file,
-** which can be a significant performance improvement on some embedded
-** platforms.
-**
-** OVERVIEW
-**
-**   The code in this file implements a minimal SQLite VFS that can be
-**   used on Linux and other posix-like operating systems. The following
-**   system calls are used:
-**
-**    File-system: access(), unlink(), getcwd()
-**    File IO:     open(), read(), write(), fsync(), close(), fstat()
-**    Other:       sleep(), usleep(), time()
-**
-**   The following VFS features are omitted:
-**
-**     1. File locking. The user must ensure that there is at most one
-**        connection to each database when using this VFS. Multiple
-**        connections to a single shared-cache count as a single connection
-**        for the purposes of the previous statement.
-**
-**     2. The loading of dynamic extensions (shared libraries).
-**
-**     3. Temporary files. The user must configure SQLite to use in-memory
-**        temp files when using this VFS. The easiest way to do this is to
-**        compile with:
-**
-**          -DSQLITE_TEMP_STORE=3
-**
-**     4. File truncation. As of version 3.6.24, SQLite may run without
-**        a working xTruncate() call, providing the user does not configure
-**        SQLite to use "journal_mode=truncate", or use both
-**        "journal_mode=persist" and ATTACHed databases.
-**
-**   It is assumed that the system uses UNIX-like path-names. Specifically,
-**   that '/' characters are used to separate path components and that
-**   a path-name is a relative path unless it begins with a '/'. And that
-**   no UTF-8 encoded paths are greater than 512 bytes in length.
-**
-** JOURNAL WRITE-BUFFERING
-**
-**   To commit a transaction to the database, SQLite first writes rollback
-**   information into the journal file. This usually consists of 4 steps:
-**
-**     1. The rollback information is sequentially written into the journal
-**        file, starting at the start of the file.
-**     2. The journal file is synced to disk.
-**     3. A modification is made to the first few bytes of the journal file.
-**     4. The journal file is synced to disk again.
-**
-**   Most of the data is written in step 1 using a series of calls to the
-**   VFS xWrite() method. The buffers passed to the xWrite() calls are of
-**   various sizes. For example, as of version 3.6.24, when committing a
-**   transaction that modifies 3 pages of a database file that uses 4096
-**   byte pages residing on a media with 512 byte sectors, SQLite makes
-**   eleven calls to the xWrite() method to create the rollback journal,
-**   as follows:
-**
-**             Write offset | Bytes written
-**             ----------------------------
-**                        0            512
-**                      512              4
-**                      516           4096
-**                     4612              4
-**                     4616              4
-**                     4620           4096
-**                     8716              4
-**                     8720              4
-**                     8724           4096
-**                    12820              4
-**             ++++++++++++SYNC+++++++++++
-**                        0             12
-**             ++++++++++++SYNC+++++++++++
-**
-**   On many operating systems, this is an efficient way to write to a file.
-**   However, on some embedded systems that do not cache writes in OS
-**   buffers it is much more efficient to write data in blocks that are
-**   an integer multiple of the sector-size in size and aligned at the
-**   start of a sector.
-**
-**   To work around this, the code in this file allocates a fixed size
-**   buffer of SQLITE_DEMOVFS_BUFFERSZ using sqlite3_malloc() whenever a
-**   journal file is opened. It uses the buffer to coalesce sequential
-**   writes into aligned SQLITE_DEMOVFS_BUFFERSZ blocks. When SQLite
-**   invokes the xSync() method to sync the contents of the file to disk,
-**   all accumulated data is written out, even if it does not constitute
-**   a complete block. This means the actual IO to create the rollback
-**   journal for the example transaction above is this:
-**
-**             Write offset | Bytes written
-**             ----------------------------
-**                        0           8192
-**                     8192           4632
-**             ++++++++++++SYNC+++++++++++
-**                        0             12
-**             ++++++++++++SYNC+++++++++++
-**
-**   Much more efficient if the underlying OS is not caching write
-**   operations.
-*/
 
 #if !defined(SQLITE_TEST) || SQLITE_OS_UNIX
 
@@ -312,6 +198,10 @@ struct sqlite3_rcvfs_handle {
   uint64_t blocksz;
   SQLITE_RCVFS_DBID dbid;
   SQLITE_RCVFS_TOKEN token;
+  SQLITE_RCVFS_LEASE *leases;  // cache of leases
+  unsigned nLeases;
+  unsigned capacityLeases;
+  uint64_t versionLeases;
 };
 
 
@@ -688,6 +578,7 @@ static int rcClose(sqlite3_file *pFile) {
   RcFile *p = (RcFile*)pFile;
   DPRINTF("close (my token %d)\n", p->handle.token.digest[0] & 0xff);
   sqlite3_free(p->blockBuffer);
+  sqlite3_free(p->handle.leases);
 
   //int retval = p->base.pMethods->xUnlock(pFile, 0);
   //assert(retval == SQLITE_OK);
@@ -872,26 +763,19 @@ static int rcFileSize(sqlite3_file *pFile, sqlite_int64 *pSize){
 
 /**
  * Reads the leases from the lock control block.  The leases array has
- * room for at least one more lock upon return.  Leases can be pre-allocated
- * on the stack when entering the function.  If it needs to be enlarged, it
- * will be malloc'd (the original leases won't be freed).
+ * room for at least one more lock upon return.
  * Returns the version number of the lock control block in lcbVersion.
- * If nLeasesOut > nLeases, the leases array needs to be freed by the caller.
  */
 static int get_lockcb(
   SQLITE_RCVFS_SESSION *rcs,
   SQLITE_RCVFS_DBID dbid,
   uint64_t tblid,
-  uint32_t nLeases,
-  SQLITE_RCVFS_LEASE **leases,
-  uint32_t *nLeasesOut,
+  SQLITE_RCVFS_HANDLE *handle,
   uint64_t *lcbVersion
 ){
   Status status;
-  *nLeasesOut = 0;
   uint32_t nbytes = 0;
   int short_read = 0;
-  int leases_mallocd = 0;
   SQLITE_RCVFS_BLOCKKEY block_key;
   block_key.dbid = dbid;
   block_key.blockid = SQLITE_RCVFS_LCBLOCK;
@@ -902,56 +786,53 @@ static int get_lockcb(
       rc_read(rcs->client, tblid,
               &block_key, sizeof(block_key),
               NULL, lcbVersion,
-              *leases, nLeases*sizeof(SQLITE_RCVFS_LEASE), &nbytes);
+              handle->leases, handle->capacityLeases*sizeof(SQLITE_RCVFS_LEASE),
+              &nbytes);
     atomic_xadd64(&sqlite_rcvfs_szread, nbytes);
     switch (status) {
       case STATUS_OBJECT_DOESNT_EXIST:
         nbytes = 0;
+        // Fall through
       case STATUS_OK:
-        *nLeasesOut = nbytes / sizeof(SQLITE_RCVFS_LEASE);
-        if (*nLeasesOut >= nLeases) {
-          if (leases_mallocd) sqlite3_free(*leases);
-          leases_mallocd = 1;
+        handle->nLeases = nbytes / sizeof(SQLITE_RCVFS_LEASE);
+        if (handle->nLeases >= handle->capacityLeases) {
           short_read = 1;
-          nLeases = *nLeasesOut + 1;
-          *leases = (SQLITE_RCVFS_LEASE *)
-            sqlite3_malloc(nLeases * sizeof(SQLITE_RCVFS_LEASE));
+          handle->capacityLeases = handle->nLeases + 1;
+          handle->leases = (SQLITE_RCVFS_LEASE *)
+            sqlite3_realloc(handle->leases,
+              handle->capacityLeases * sizeof(SQLITE_RCVFS_LEASE));
         } else {
           short_read = 0;
         }
         break;
       default:
-        if (leases_mallocd) sqlite3_free(*leases);
         return SQLITE_IOERR_LOCK;
     }
   } while (short_read);
 
   DPRINTF("retrieved lock control block of size %d\n", *nLeasesOut);
+  handle->versionLeases = *lcbVersion;
   return SQLITE_OK;
 }
 
-static void cleanup_lockcb(
-  SQLITE_RCVFS_LEASE *leases,
-  SQLITE_RCVFS_TOKEN *my_token,
-  char max_lease_type,
-  uint32_t nleases,
-  uint32_t *nLeasesOut
-){
-  *nLeasesOut = nleases;
+static void cleanup_lockcb(SQLITE_RCVFS_HANDLE *handle, char max_lease_type) {
   uint32_t i;
-  for (i = 0; i < *nLeasesOut; ) {
-    int owned = is_owned(&leases[i], my_token);
-    int valid_lease = is_locked(&leases[i]);
-    if (owned && (leases[i].lease_type == PENDING_LOCK)) valid_lease = 0;
-    if (owned && (leases[i].lease_type > max_lease_type)) valid_lease = 0;
+  for (i = 0; i < handle->nLeases; ) {
+    int owned = is_owned(&(handle->leases[i]), &(handle->token));
+    int valid_lease = is_locked(&(handle->leases[i]));
+    if (owned && (handle->leases[i].lease_type == PENDING_LOCK))
+      valid_lease = 0;
+    if (owned && (handle->leases[i].lease_type > max_lease_type))
+      valid_lease = 0;
 
     if (!valid_lease) {
-      DPRINTF("removing a lock (mylock: %d)\n", is_owned(&leases[i], my_token));
+      DPRINTF("removing a lock (mylock: %d)\n",
+              is_owned(&(handle->leases[i]), &(handle->token)));
       // Shrink array
       uint32_t j;
-      for (j = i+1; j < *nLeasesOut; ++j)
-        leases[j-1] = leases[j];
-      *nLeasesOut = *nLeasesOut - 1;
+      for (j = i+1; j < handle->nLeases; ++j)
+        handle->leases[j-1] = handle->leases[j];
+      handle->nLeases--;
     } else {
       ++i;
     }
@@ -964,13 +845,11 @@ static void cleanup_lockcb(
  */
 static int rcLock(sqlite3_file *pFile, int eLock){
   RcFile *p = (RcFile *)pFile;
-  DPRINTF("lock %d  (mytoken %d) (%p)\n", eLock, p->handle.token.digest[0] & 0xff, pFile);
+  DPRINTF("lock %d  (mytoken %d) (%p)\n",
+          eLock, p->handle.token.digest[0] & 0xff, pFile);
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_LOCK;
   uint64_t tblid = p->handle.tblid;
-  SQLITE_RCVFS_LEASE *leases = (SQLITE_RCVFS_LEASE *)
-    alloca(SQLITE_RCVFS_STACKLEASES * sizeof(SQLITE_RCVFS_LEASE));
-  SQLITE_RCVFS_LEASE *leases_on_stack = leases;
   SQLITE_RCVFS_LEASE new_lease;
   memset(&new_lease, 0, sizeof(new_lease));
   new_lease.lease_type = eLock;
@@ -978,51 +857,46 @@ static int rcLock(sqlite3_file *pFile, int eLock){
   new_lease.deadline = time(NULL) + SQLITE_RCVFS_LEASETIME;
 
   int result;
+  uint64_t lcbVersion = 0;
   do {
     result = -1;
-    if (leases != leases_on_stack) {
-      sqlite3_free(leases);
-      leases = leases_on_stack;
+    if ((p->handle.versionLeases == 0) || (lcbVersion > 0)) {
+      int retval;
+      retval = get_lockcb(rcs, p->handle.dbid, tblid, &(p->handle), &lcbVersion);
+      if (retval != SQLITE_OK) return retval;
+    } else {
+      lcbVersion = p->handle.versionLeases;
     }
-    uint32_t nleases;
-    uint64_t lcbVersion;
-    int retval;
-    retval = get_lockcb(rcs, p->handle.dbid, tblid, SQLITE_RCVFS_STACKLEASES,
-                        &leases, &nleases, &lcbVersion);
-    if (retval != SQLITE_OK) return retval;
 
     struct RejectRules rrules;
     memset(&rrules, 0, sizeof(rrules));
-    if (nleases == 0) {
-      rrules.exists = 1;
-    } else {
+    if (lcbVersion > 0) {
       rrules.givenVersion = lcbVersion;
       rrules.versionNeGiven = 1;
-      rrules.doesntExist = 1;
     }
 
-    cleanup_lockcb(leases, &(p->handle.token), EXCLUSIVE_LOCK, nleases,
-                   &nleases);
+    cleanup_lockcb(&(p->handle), EXCLUSIVE_LOCK);
     int other_shared = 0;
     int other_reserved = 0;
     int other_pending = 0;
     int other_exclusive = 0;
     unsigned i;
-    for (i = 0; i < nleases; ++i) {
+    for (i = 0; i < p->handle.nLeases; ++i) {
       DPRINTF("found a lock of type %d, token %d (mytoken %d) (%p)\n",
-              leases[i].lease_type & 0xff, leases[i].token.digest[0] & 0xff, p->handle.token.digest[0] & 0xff, p);
-      if (is_owned(&leases[i], &(p->handle.token))) {
+              p->handle.leases[i].lease_type & 0xff,
+              p->handle.leases[i].token.digest[0] & 0xff,
+              p->handle.token.digest[0] & 0xff,
+              p);
+      if (is_owned(&(p->handle.leases[i]), &(p->handle.token))) {
         // Do I have already a lock of the required type or better?
-        if (leases[i].lease_type >= eLock) {
-          if (leases != leases_on_stack) sqlite3_free(leases);
-          return SQLITE_OK;
-        }
+        if (p->handle.leases[i].lease_type >= eLock) return SQLITE_OK;
       } else {
         // Not my locks
-        if (leases[i].lease_type == SHARED_LOCK) other_shared = 1;
-        if (leases[i].lease_type == RESERVED_LOCK) other_reserved = 1;
-        if (leases[i].lease_type == PENDING_LOCK) other_pending = 1;
-        if (leases[i].lease_type == EXCLUSIVE_LOCK) other_exclusive = 1;
+        if (p->handle.leases[i].lease_type == SHARED_LOCK) other_shared = 1;
+        if (p->handle.leases[i].lease_type == RESERVED_LOCK) other_reserved = 1;
+        if (p->handle.leases[i].lease_type == PENDING_LOCK) other_pending = 1;
+        if (p->handle.leases[i].lease_type == EXCLUSIVE_LOCK)
+          other_exclusive = 1;
       }
     }
     switch (eLock) {
@@ -1055,8 +929,9 @@ static int rcLock(sqlite3_file *pFile, int eLock){
       new_lease.lease_type = PENDING_LOCK;
     }
     if (new_lockcb) {
-      DPRINTF("writing new lockcb of size %d (%p)\n", nleases+1, p);
-      leases[nleases] = new_lease;
+      DPRINTF("writing new lockcb of size %d (%p)\n", p->handle.nLeases+1, p);
+      p->handle.leases[p->handle.nLeases] = new_lease;
+      p->handle.nLeases++;
       SQLITE_RCVFS_BLOCKKEY block_key;
       block_key.dbid = p->handle.dbid;
       block_key.blockid = SQLITE_RCVFS_LCBLOCK;
@@ -1064,12 +939,13 @@ static int rcLock(sqlite3_file *pFile, int eLock){
       Status status =
         rc_write(rcs->client, tblid,
                  &block_key, sizeof(block_key),
-                 leases, (nleases+1) * sizeof(SQLITE_RCVFS_LEASE),
-                 &rrules, NULL);
+                 p->handle.leases, p->handle.nLeases*sizeof(SQLITE_RCVFS_LEASE),
+                 &rrules, &lcbVersion);
       switch (status) {
         case STATUS_OK:
           atomic_xadd64(&sqlite_rcvfs_szwrite,
-                        (nleases+1) * sizeof(SQLITE_RCVFS_LEASE));
+                        p->handle.nLeases * sizeof(SQLITE_RCVFS_LEASE));
+          p->handle.versionLeases = lcbVersion;
           break;
         case STATUS_OBJECT_EXISTS:
         case STATUS_OBJECT_DOESNT_EXIST:
@@ -1083,75 +959,63 @@ static int rcLock(sqlite3_file *pFile, int eLock){
   } while (result < 0);
 
   DPRINTF("lock result %d (%p)\n", result, p);
-  if (leases != leases_on_stack) sqlite3_free(leases);
   return result;
 }
 
 
 static int rcUnlock(sqlite3_file *pFile, int eLock) {
   RcFile *p = (RcFile *)pFile;
-  DPRINTF("unlock to new level %d (mytoken %d) (%p)\n", eLock, p->handle.token.digest[0] & 0xff, pFile);
+  DPRINTF("unlock to new level %d (mytoken %d) (%p)\n",
+          eLock, p->handle.token.digest[0] & 0xff, pFile);
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_LOCK;
   uint64_t tblid = p->handle.tblid;
-  SQLITE_RCVFS_LEASE *leases = (SQLITE_RCVFS_LEASE *)
-    alloca(SQLITE_RCVFS_STACKLEASES * sizeof(SQLITE_RCVFS_LEASE));
-  SQLITE_RCVFS_LEASE *leases_on_stack = leases;
 
   int result;
+  uint64_t lcbVersion = 0;
   do {
-    if (leases != leases_on_stack) {
-      sqlite3_free(leases);
-      leases = leases_on_stack;
+    if (lcbVersion > 0) {
+      int retval;
+      retval = get_lockcb(rcs, p->handle.dbid, tblid, &(p->handle), &lcbVersion);
+      if (retval != SQLITE_OK) return retval;
+      DPRINTF("retrieved %d leases (%p)\n", p->handle.nLeases, p);
+      if (p->handle.nLeases == 0) return SQLITE_OK;
+    } else {
+      lcbVersion = p->handle.versionLeases;
     }
-    uint32_t nleases;
-    uint64_t lcbVersion;
-    int retval;
-    retval = get_lockcb(rcs, p->handle.dbid, tblid, SQLITE_RCVFS_STACKLEASES,
-                        &leases, &nleases, &lcbVersion);
-    if (retval != SQLITE_OK) return retval;
-    DPRINTF("retrieved %d leases (%p)\n", nleases, p);
-    if (nleases == 0) return SQLITE_OK;
 
     struct RejectRules rrules;
     memset(&rrules, 0, sizeof(rrules));
     rrules.givenVersion = lcbVersion;
     rrules.versionNeGiven = 1;
-    rrules.doesntExist = 1;
 
-    cleanup_lockcb(leases, &(p->handle.token), NO_LOCK, nleases, &nleases);
+    cleanup_lockcb(&(p->handle), NO_LOCK);
     if (eLock == SHARED_LOCK) {
       SQLITE_RCVFS_LEASE new_lease;
       memset(&new_lease, 0, sizeof(new_lease));
       new_lease.lease_type = SHARED_LOCK;
       new_lease.token = p->handle.token;
       new_lease.deadline = time(NULL) + SQLITE_RCVFS_LEASETIME;
-      leases[nleases] = new_lease;
-      nleases++;
+      p->handle.leases[p->handle.nLeases] = new_lease;
+      p->handle.nLeases++;
     }
-    DPRINTF("cleanup+mod: now %d leases (%p)\n", nleases, p);
+    DPRINTF("cleanup+mod: now %d leases (%p)\n", p->handle.nLeases, p);
 
     SQLITE_RCVFS_BLOCKKEY block_key;
     block_key.dbid = p->handle.dbid;
     block_key.blockid = SQLITE_RCVFS_LCBLOCK;
     Status status;
-    if (nleases == 0) {
-      atomic_inc64(&sqlite_rcvfs_nremove);
-      status = rc_remove(rcs->client, tblid,
-                         &block_key, sizeof(block_key),
-                         &rrules, NULL);
-    } else {
-      atomic_inc64(&sqlite_rcvfs_nwrite);
-      status = rc_write(rcs->client, tblid,
-                        &block_key, sizeof(block_key),
-                        leases, nleases * sizeof(SQLITE_RCVFS_LEASE),
-                        &rrules, NULL);
-      if (status == STATUS_OK)
-        atomic_xadd64(&sqlite_rcvfs_szwrite,
-                      nleases * sizeof(SQLITE_RCVFS_LEASE));
-    }
+    uint32_t nbytes = p->handle.nLeases * sizeof(SQLITE_RCVFS_LEASE);
+    if (nbytes == 0) nbytes = 1;
+    atomic_inc64(&sqlite_rcvfs_nwrite);
+    status = rc_write(rcs->client, tblid,
+                      &block_key, sizeof(block_key),
+                      p->handle.leases, nbytes,
+                      &rrules, &lcbVersion);
     switch (status) {
       case STATUS_OK:
+        atomic_xadd64(&sqlite_rcvfs_szwrite, nbytes);
+        p->handle.versionLeases = lcbVersion;
         result = SQLITE_OK;
         break;
       case STATUS_WRONG_VERSION:
@@ -1164,7 +1028,6 @@ static int rcUnlock(sqlite3_file *pFile, int eLock) {
   } while (result < 0);
 
   DPRINTF("unlock result %d (%p)\n", result, p);
-  if (leases != leases_on_stack) sqlite3_free(leases);
   return result;
 }
 
@@ -1174,27 +1037,23 @@ static int rcCheckReservedLock(sqlite3_file *pFile, int *pResOut){
   RcFile *p = (RcFile *)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_LOCK;
-  uint64_t tblid = p->handle.tblid;
-  SQLITE_RCVFS_LEASE *leases = (SQLITE_RCVFS_LEASE *)
-    alloca(SQLITE_RCVFS_STACKLEASES * sizeof(SQLITE_RCVFS_LEASE));
-  SQLITE_RCVFS_LEASE *leases_on_stack = leases;
 
-  uint32_t nleases;
-  uint64_t lcbVersion;
+  uint64_t tblid = p->handle.tblid;
+  uint64_t lcbVersion = 0;
   int retval;
-  retval = get_lockcb(rcs, p->handle.dbid, tblid, SQLITE_RCVFS_STACKLEASES,
-                      &leases, &nleases, &lcbVersion);
+  retval = get_lockcb(rcs, p->handle.dbid, tblid, &(p->handle), &lcbVersion);
   if (retval != SQLITE_OK) return retval;
 
   *pResOut = 0;
   unsigned i;
-  for (i = 0; i < nleases; ++i) {
-    if (is_locked(&leases[i]) && (leases[i].lease_type == RESERVED_LOCK)) {
+  for (i = 0; i < p->handle.nLeases; ++i) {
+    if (is_locked(&(p->handle.leases[i])) &&
+        (p->handle.leases[i].lease_type == RESERVED_LOCK))
+    {
       *pResOut = 1;
       break;
     }
   }
-  if (leases != leases_on_stack) sqlite3_free(leases);
   return SQLITE_OK;
 }
 
@@ -1513,6 +1372,11 @@ static int rcOpen(
   p->handle.tblid = tblid;
   p->handle.size = dbheader.size;
   p->handle.blocksz = dbheader.blocksz;
+  p->handle.versionLeases = 0;
+  p->handle.nLeases = 0;
+  p->handle.capacityLeases = SQLITE_RCVFS_STACKLEASES;
+  p->handle.leases = (SQLITE_RCVFS_LEASE *)
+    sqlite3_malloc(p->handle.capacityLeases * sizeof(SQLITE_RCVFS_LEASE));
   p->flags = flags;
   p->permanentSize = p->handle.size;
   p->blockBuffer = (SQLITE_RCVFS_WBUFFER *)
