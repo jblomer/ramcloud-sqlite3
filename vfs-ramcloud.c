@@ -1389,6 +1389,128 @@ static int rcOpen(
 }
 
 
+//------------------------------------------------------------------------------
+
+
+int sqlite3_rcvfs_upload(SQLITE_RCVFS_CONNECTION *conn, const char *path) {
+  SQLITE_RCVFS_SESSION *rcs = get_rc_session(conn);
+  if (!rcs) return SQLITE_IOERR;
+  int retval;
+
+  char absPath[MAXPATHNAME+1];
+  retval = rcFullPathname(NULL, path, MAXPATHNAME+1, absPath);
+  if (retval != SQLITE_OK) return retval;
+
+  SQLITE_RCVFS_DBID dbid = mk_dbid(absPath);
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = dbid;
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
+  SQLITE_RCVFS_DBHEADER dbheader;
+  memset(&dbheader, 0, sizeof(dbheader));
+
+  FILE *fsrc = fopen(path, "r");
+  if (!fsrc) return SQLITE_CANTOPEN;
+
+  dbheader.version = 1;
+  dbheader.blocksz = SQLITE_RCVFS_BLOCKSZ;
+  struct RejectRules rrules;
+  memset(&rrules, 0, sizeof(rrules));
+  rrules.exists = 1;
+  atomic_inc64(&sqlite_rcvfs_nwrite);
+  Status status = rc_write(rcs->client, conn->tblid,
+                           &block_key, sizeof(block_key),
+                           &dbheader, sizeof(dbheader), &rrules, NULL);
+  if (status != STATUS_OK) return SQLITE_CANTOPEN;
+
+  RcFile f;
+  memset(&f, 0, sizeof(RcFile));
+  f.handle.conn = conn;
+  f.handle.dbid = dbid;
+  f.handle.tblid = conn->tblid;
+  f.handle.size = dbheader.size;
+  f.handle.blocksz = dbheader.blocksz;
+  f.permanentSize = f.handle.size;
+  f.blockBuffer = (SQLITE_RCVFS_WBUFFER *)
+    sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
+  unsigned i;
+  for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
+    clearBufferBlock(f.blockBuffer, i);
+
+  sqlite_int64 iOfst = 0;
+  unsigned char buf[SQLITE_RCVFS_BLOCKSZ];
+  do {
+    size_t nbytes = fread(buf, 1, SQLITE_RCVFS_BLOCKSZ, fsrc);
+    if (nbytes == 0) break;
+
+    retval = rcBufferedWrite(rcs, &f, buf, nbytes, iOfst);
+    if (retval != SQLITE_OK) {
+      rcClose((struct sqlite3_file *)&f);
+      return retval;
+    }
+    iOfst += nbytes;
+  } while (1);
+  retval = rcSync((struct sqlite3_file *)&f, 0);
+  rcClose((struct sqlite3_file *)&f);
+  return retval;
+}
+
+int sqlite3_rcvfs_download(SQLITE_RCVFS_CONNECTION *conn, const char *path) {
+  SQLITE_RCVFS_SESSION *rcs = get_rc_session(conn);
+  if (!rcs) return SQLITE_IOERR;
+  int retval;
+
+  char absPath[MAXPATHNAME+1];
+  retval = rcFullPathname(NULL, path, MAXPATHNAME+1, absPath);
+  if (retval != SQLITE_OK) return retval;
+
+  SQLITE_RCVFS_DBID dbid = mk_dbid(absPath);
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = dbid;
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
+  SQLITE_RCVFS_DBHEADER dbheader;
+  memset(&dbheader, 0, sizeof(dbheader));
+
+  uint32_t nbytes = 0;
+  atomic_inc64(&sqlite_rcvfs_nread);
+  Status status = rc_read(rcs->client, conn->tblid,
+                          &block_key, sizeof(block_key),
+                          NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
+  if (status != STATUS_OK) return SQLITE_CANTOPEN;
+
+  FILE *fdst = fopen(path, "w");
+  if (!fdst) return SQLITE_CANTOPEN;
+
+  RcFile f;
+  memset(&f, 0, sizeof(RcFile));
+  f.handle.conn = conn;
+  f.handle.dbid = dbid;
+  f.handle.tblid = conn->tblid;
+  f.handle.size = dbheader.size;
+  f.handle.blocksz = dbheader.blocksz;
+  f.permanentSize = f.handle.size;
+  f.blockBuffer = (SQLITE_RCVFS_WBUFFER *)
+    sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
+  unsigned i;
+  for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
+    clearBufferBlock(f.blockBuffer, i);
+
+  sqlite_int64 iOfst = 0;
+  unsigned char buf[SQLITE_RCVFS_BLOCKSZ];
+  for (iOfst = 0; iOfst < f.handle.size; iOfst += SQLITE_RCVFS_BLOCKSZ) {
+    retval = rcRead((struct sqlite3_file *)&f, buf, SQLITE_RCVFS_BLOCKSZ, iOfst);
+    if (retval != SQLITE_OK) {
+      rcClose((struct sqlite3_file *)&f);
+      fclose(fdst);
+      return retval;
+    }
+    // TODO error handling
+    fwrite(buf, 1, SQLITE_RCVFS_BLOCKSZ, fdst);
+  }
+  rcClose((struct sqlite3_file *)&f);
+  fclose(fdst);
+  return retval;
+}
+
 /**
  * This function returns a pointer to the VFS implemented in this file.
  * To make the VFS available to SQLite:

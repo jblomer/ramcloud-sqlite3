@@ -15,6 +15,8 @@ SQLITE_RCVFS_CONNECTION *sqlite3_rcvfs_connect(const char *locator,
                                                const char *table_name);
 void sqlite3_rcvfs_disconnect(SQLITE_RCVFS_CONNECTION *conn);
 void sqlite3_rcvfs_get_stats(SQLITE_RCVFS_STATS *stats);
+int sqlite3_rcvfs_upload(SQLITE_RCVFS_CONNECTION *conn, const char *path);
+int sqlite3_rcvfs_download(SQLITE_RCVFS_CONNECTION *conn, const char *path);
 
 sqlite3_vfs *sqlite3_rcvfs(const char *vfs_name, SQLITE_RCVFS_CONNECTION *conn);
 

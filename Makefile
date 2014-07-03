@@ -1,9 +1,15 @@
-all: libsqlite3.a libvfs-ramcloud.a test test2 test3
+all: libsqlite3.a libvfs-ramcloud.a test test2 test3 upload download
 
 DEBUG = no
 ifeq ($(DEBUG),yes)
 DEBUGFLAGS = -DDEBUG
 endif
+
+download: download.c vfs-ramcloud.h vfs-ramcloud-stats.h libvfs-ramcloud.a libsqlite3.a
+	gcc -pthread -std=c99 -O2 -g -Wall -o download download.c libvfs-ramcloud.a libsqlite3.a -ldl -lramcloud
+
+upload: upload.c vfs-ramcloud.h vfs-ramcloud-stats.h libvfs-ramcloud.a libsqlite3.a
+	gcc -pthread -std=c99 -O2 -g -Wall -o upload upload.c libvfs-ramcloud.a libsqlite3.a -ldl -lramcloud
 
 test3: test3.c vfs-ramcloud.h vfs-ramcloud-stats.h libvfs-ramcloud.a libsqlite3.a
 	gcc -pthread -std=c99 -O2 -g -Wall -o test3 test3.c libsqlite3.a libvfs-ramcloud.a -ldl -lramcloud
@@ -32,4 +38,4 @@ clean:
 	rm -f *.o *.d
 	rm -f libsqlite3.a
 	rm -f libvfs-ramcloud.a
-	rm -f test test2 test3
+	rm -f test test2 test3 download upload
