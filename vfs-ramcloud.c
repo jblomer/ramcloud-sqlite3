@@ -808,7 +808,7 @@ static int get_lockcb(
     }
   } while (short_read);
 
-  DPRINTF("retrieved lock control block of size %d\n", *nLeasesOut);
+  DPRINTF("retrieved lock control block of size %d\n", handle->nLeases);
   handle->versionLeases = *lcbVersion;
   return SQLITE_OK;
 }
@@ -1509,6 +1509,32 @@ int sqlite3_rcvfs_download(SQLITE_RCVFS_CONNECTION *conn, const char *path) {
   rcClose((struct sqlite3_file *)&f);
   fclose(fdst);
   return retval;
+}
+
+int sqlite3_rcvfs_delete(SQLITE_RCVFS_CONNECTION *conn, const char *path) {
+  SQLITE_RCVFS_SESSION *rcs = get_rc_session(conn);
+  if (!rcs) return SQLITE_IOERR;
+  int retval;
+
+  char absPath[MAXPATHNAME+1];
+  retval = rcFullPathname(NULL, path, MAXPATHNAME+1, absPath);
+  if (retval != SQLITE_OK) return retval;
+
+  SQLITE_RCVFS_DBID dbid = mk_dbid(absPath);
+  SQLITE_RCVFS_BLOCKKEY block_key;
+  block_key.dbid = dbid;
+  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
+  SQLITE_RCVFS_DBHEADER dbheader;
+  memset(&dbheader, 0, sizeof(dbheader));
+
+  uint32_t nbytes = 0;
+  atomic_inc64(&sqlite_rcvfs_nread);
+  Status status = rc_read(rcs->client, conn->tblid,
+                          &block_key, sizeof(block_key),
+                          NULL, NULL, &dbheader, sizeof(dbheader), &nbytes);
+  if (status != STATUS_OK) return SQLITE_IOERR;
+
+  return rcDeleteInternal(rcs, dbid, dbheader.blocksz, dbheader.size);
 }
 
 /**
