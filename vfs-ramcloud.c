@@ -666,6 +666,7 @@ static int rcRead(
       }
       block = p->blockBuffer->buf[idx_free_block];
       p->blockBuffer->blockIds[idx_free_block] = block_key.blockid;
+      DPRINTF("real block read\n");
       atomic_inc64(&sqlite_rcvfs_nread);
       Status status = rc_read(rcs->client, p->handle.tblid,
                               &block_key, sizeof(block_key), NULL, NULL,
