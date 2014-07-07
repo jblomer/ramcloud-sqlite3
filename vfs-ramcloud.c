@@ -391,7 +391,7 @@ static int rcFlushBlockBuffer(
   DPRINTF("flush block buffer\n");
   if (!p->blockBuffer) return SQLITE_OK;
 
-  uint16_t N = SQLITE_RCVFS_WBUF_NBLOCKS;
+  uint16_t N = SQLITE_RCVFS_WBUF_NBLOCKS + 1;
   uint16_t szMultiOpWrite = rc_multiOpSizeOf(MULTI_OP_WRITE);
   SQLITE_RCVFS_BLOCKKEY *block_keys = (SQLITE_RCVFS_BLOCKKEY *)
     alloca(N * sizeof(SQLITE_RCVFS_BLOCKKEY));
@@ -417,6 +417,23 @@ static int rcFlushBlockBuffer(
     }
   }
   if (num_requests == 0) return SQLITE_OK;
+
+  // Write modified file size
+  SQLITE_RCVFS_DBHEADER dbheader;
+  memset(&dbheader, 0, sizeof(dbheader));
+  dbheader.version = 1;
+  dbheader.size = p->handle.size;
+  dbheader.blocksz = p->handle.blocksz;
+  block_keys[num_requests].dbid = p->handle.dbid;
+  block_keys[num_requests].blockid = SQLITE_RCVFS_HEADERBLOCK;
+  pmWriteObjects[num_requests] =
+    mWriteObjects + (num_requests * szMultiOpWrite);
+  rc_multiWriteCreate(rcs->conn->tblid,
+                      &(block_keys[num_requests]), sizeof(SQLITE_RCVFS_BLOCKKEY),
+                      &dbheader, sizeof(dbheader),
+                      NULL, pmWriteObjects[num_requests]);
+  atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
+  num_requests++;
 
   atomic_inc64(&sqlite_rcvfs_nmwrite);
   rc_multiWrite(rcs->client, pmWriteObjects, num_requests);
@@ -715,26 +732,6 @@ static int rcSync(sqlite3_file *pFile, int flags){
   retval = rcFlushBlockBuffer(rcs, p);
   if (retval != SQLITE_OK) return retval;
 
-  // Write modified file size
-  SQLITE_RCVFS_DBHEADER dbheader;
-  memset(&dbheader, 0, sizeof(dbheader));
-  dbheader.version = 1;
-  dbheader.size = p->handle.size;
-  dbheader.blocksz = p->handle.blocksz;
-  SQLITE_RCVFS_BLOCKKEY block_key;
-  block_key.dbid = p->handle.dbid;
-  block_key.blockid = SQLITE_RCVFS_HEADERBLOCK;
-  Status status;
-  atomic_inc64(&sqlite_rcvfs_nwrite);
-  status = rc_write(rcs->client, p->handle.tblid,
-                    &block_key, sizeof(block_key),
-                    &dbheader, sizeof(dbheader), NULL, NULL);
-  if (status != STATUS_OK) {
-    DPRINTF("syncing failed %d\n", status);
-    return SQLITE_IOERR_FSYNC;
-  }
-  atomic_xadd64(&sqlite_rcvfs_szwrite, sizeof(dbheader));
-  p->permanentSize = p->handle.size;
   DPRINTF("syncing ok\n");
   return SQLITE_OK;
 }
@@ -1076,8 +1073,8 @@ static int rcSectorSize(sqlite3_file *pFile) {
 static int rcDeviceCharacteristics(sqlite3_file *pFile) {
   return
     SQLITE_IOCAP_ATOMIC1K |
-    SQLITE_IOCAP_SAFE_APPEND |
-    SQLITE_IOCAP_SEQUENTIAL |
+    //SQLITE_IOCAP_SAFE_APPEND |
+    //SQLITE_IOCAP_SEQUENTIAL |
     SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN;
 }
 
