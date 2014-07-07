@@ -605,6 +605,7 @@ static int rcRead(
 ){
   //printf("R %d %lld\n", iAmt, iOfst);
   DPRINTF("read %d %lld\n", iAmt, iOfst);
+  memset(zBuf, 0, iAmt);
   RcFile *p = (RcFile*)pFile;
   SQLITE_RCVFS_SESSION *rcs = get_rc_session(p->handle.conn);
   if (!rcs) return SQLITE_IOERR_READ;
