@@ -49,7 +49,7 @@ extern "C" {
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
 // Allocate so many leases on stack and only use malloc if this is not enough
 #define SQLITE_RCVFS_STACKLEASES 8
-#define SQLITE_RCVFS_LEASETIME 20000  // 20 seconds lease time
+#define SQLITE_RCVFS_LEASETIME 120  // 2 minutes lease time
 #define SQLITE_RCVFS_WBUF_NBLOCKS 128
 
 /**
