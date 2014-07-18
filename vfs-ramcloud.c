@@ -47,8 +47,8 @@ extern "C" {
 #endif
 
 #define SQLITE_RCVFS_TIMESKEW 2  // 2 seconds maximum time de-syncronization
-// Allocate so many leases on stack and only use malloc if this is not enough
-#define SQLITE_RCVFS_STACKLEASES 8
+// Allocate so many leases by default with a database connection
+#define SQLITE_RCVFS_NLEASES_DEFAULT 8
 #define SQLITE_RCVFS_LEASETIME 120  // 2 minutes lease time
 #define SQLITE_RCVFS_WBUF_NBLOCKS 128
 
@@ -1366,7 +1366,7 @@ static int rcOpen(
   p->handle.blocksz = dbheader.blocksz;
   p->handle.versionLeases = 0;
   p->handle.nLeases = 0;
-  p->handle.capacityLeases = SQLITE_RCVFS_STACKLEASES;
+  p->handle.capacityLeases = SQLITE_RCVFS_NLEASES_DEFAULT;
   p->handle.leases = (SQLITE_RCVFS_LEASE *)
     sqlite3_malloc(p->handle.capacityLeases * sizeof(SQLITE_RCVFS_LEASE));
   p->flags = flags;
