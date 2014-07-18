@@ -228,6 +228,7 @@ struct sqlite3_rcvfs_wbuffer {
   SQLITE_RCVFS_BLOCKID blockIds[SQLITE_RCVFS_WBUF_NBLOCKS];
   uint16_t blockSizes[SQLITE_RCVFS_WBUF_NBLOCKS];
   unsigned char buf[SQLITE_RCVFS_WBUF_NBLOCKS][SQLITE_RCVFS_BLOCKSZ];
+  unsigned gauge;
 };
 static inline void clearBufferBlock(SQLITE_RCVFS_WBUFFER *buf, unsigned idx) {
   buf->blockIds[idx] = SQLITE_RCVFS_INVALIDBLOCK;
@@ -400,21 +401,19 @@ static int rcFlushBlockBuffer(
 
   unsigned num_requests = 0;
   unsigned i;
-  for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i) {
-    if (!isInvalidBlock(&(p->blockBuffer->blockIds[i]))) {
-      block_keys[num_requests].dbid = p->handle.dbid;
-      block_keys[num_requests].blockid = p->blockBuffer->blockIds[i];
-      pmWriteObjects[num_requests] =
-        mWriteObjects + (num_requests * szMultiOpWrite);
-      rc_multiWriteCreate(rcs->conn->tblid,
-                          &(block_keys[num_requests]), sizeof(SQLITE_RCVFS_BLOCKKEY),
-                          p->blockBuffer->buf[num_requests],
-                          p->blockBuffer->blockSizes[num_requests],
-                          NULL, pmWriteObjects[num_requests]);
-      atomic_xadd64(&sqlite_rcvfs_szwrite,
-                    p->blockBuffer->blockSizes[num_requests]);
-      num_requests++;
-    }
+  for (i = 0; i < p->blockBuffer->gauge; ++i) {
+    block_keys[num_requests].dbid = p->handle.dbid;
+    block_keys[num_requests].blockid = p->blockBuffer->blockIds[i];
+    pmWriteObjects[num_requests] =
+      mWriteObjects + (num_requests * szMultiOpWrite);
+    rc_multiWriteCreate(rcs->conn->tblid,
+                        &(block_keys[num_requests]), sizeof(SQLITE_RCVFS_BLOCKKEY),
+                        p->blockBuffer->buf[num_requests],
+                        p->blockBuffer->blockSizes[num_requests],
+                        NULL, pmWriteObjects[num_requests]);
+    atomic_xadd64(&sqlite_rcvfs_szwrite,
+                  p->blockBuffer->blockSizes[num_requests]);
+    num_requests++;
   }
   if (num_requests == 0) return SQLITE_OK;
 
@@ -440,6 +439,7 @@ static int rcFlushBlockBuffer(
   memset(p->blockBuffer, 0, sizeof(p->blockBuffer));
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     clearBufferBlock(p->blockBuffer, i);
+  p->blockBuffer->gauge = 0;
 
   int result = SQLITE_OK;
   for (i = 0; i < num_requests; ++i) {
@@ -485,31 +485,26 @@ static int rcBufferedWrite(
     // Check in buffer
     int in_cache = 0;
     unsigned i;
-    int idx_free_block = -1;
-    for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i) {
+    for (i = 0; i < p->blockBuffer->gauge; ++i) {
       if (p->blockBuffer->blockIds[i].blockno == block_key.blockid.blockno) {
         block = p->blockBuffer->buf[i];
         this_blocksz = p->blockBuffer->blockSizes[i];
         in_cache = 1;
         break;
-      } else if ((idx_free_block == -1) &&
-                 isInvalidBlock(&(p->blockBuffer->blockIds[i])))
-      {
-        idx_free_block = i;
       }
     }
 
     // If not already in buffer, occupy a new block.  Flush if necessary.
     if (!in_cache) {
-      if (idx_free_block == -1) {
+      if (p->blockBuffer->gauge == SQLITE_RCVFS_WBUF_NBLOCKS) {
         int retval = rcFlushBlockBuffer(rcs, p);
         if (retval != SQLITE_OK) return retval;
-        idx_free_block = 0;
       }
-      block = p->blockBuffer->buf[idx_free_block];
-      p->blockBuffer->blockIds[idx_free_block] = block_key.blockid;
-      if ((pos_in_block + nbytes) > p->blockBuffer->blockSizes[idx_free_block])
-        p->blockBuffer->blockSizes[idx_free_block] = pos_in_block + nbytes;
+      unsigned idx = p->blockBuffer->gauge++;
+      block = p->blockBuffer->buf[idx];
+      p->blockBuffer->blockIds[idx] = block_key.blockid;
+      if ((pos_in_block + nbytes) > p->blockBuffer->blockSizes[idx])
+        p->blockBuffer->blockSizes[idx] = pos_in_block + nbytes;
     }
 
     // Read only if this is not a full block and not in cache and if there
@@ -644,7 +639,7 @@ static int rcRead(
     // Check in blockBuffer
     if (p->blockBuffer) {
       unsigned i;
-      for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i) {
+      for (i = 0; i < p->blockBuffer->gauge; ++i) {
         if (p->blockBuffer->blockIds[i].blockno == block_key.blockid.blockno) {
           block = p->blockBuffer->buf[i];
           size_of_block = p->blockBuffer->blockSizes[i];
@@ -1378,6 +1373,7 @@ static int rcOpen(
   p->permanentSize = p->handle.size;
   p->blockBuffer = (SQLITE_RCVFS_WBUFFER *)
     sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
+  p->blockBuffer->gauge = 0;
   unsigned i;
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     clearBufferBlock(p->blockBuffer, i);
@@ -1431,6 +1427,7 @@ int sqlite3_rcvfs_upload(SQLITE_RCVFS_CONNECTION *conn, const char *path) {
   f.permanentSize = f.handle.size;
   f.blockBuffer = (SQLITE_RCVFS_WBUFFER *)
     sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
+  f.blockBuffer->gauge = 0;
   unsigned i;
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     clearBufferBlock(f.blockBuffer, i);
@@ -1489,6 +1486,7 @@ int sqlite3_rcvfs_download(SQLITE_RCVFS_CONNECTION *conn, const char *path) {
   f.permanentSize = f.handle.size;
   f.blockBuffer = (SQLITE_RCVFS_WBUFFER *)
     sqlite3_malloc(sizeof(SQLITE_RCVFS_WBUFFER));
+  f.blockBuffer->gauge = 0;
   unsigned i;
   for (i = 0; i < SQLITE_RCVFS_WBUF_NBLOCKS; ++i)
     clearBufferBlock(f.blockBuffer, i);
