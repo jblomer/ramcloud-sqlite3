@@ -21,6 +21,9 @@ int sqlite3_rcvfs_delete(SQLITE_RCVFS_CONNECTION *conn, const char *path);
 
 sqlite3_vfs *sqlite3_rcvfs(const char *vfs_name, SQLITE_RCVFS_CONNECTION *conn);
 
+// TODO
+void sqlite3_rcvfs_refresh_leases(SQLITE_RCVFS_CONNECTION *conn);
+
 #ifdef __cplusplus
 }
 #endif
