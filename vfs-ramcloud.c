@@ -1069,8 +1069,8 @@ static int rcSectorSize(sqlite3_file *pFile) {
 static int rcDeviceCharacteristics(sqlite3_file *pFile) {
   return
     SQLITE_IOCAP_ATOMIC1K |
-    //SQLITE_IOCAP_SAFE_APPEND |
-    //SQLITE_IOCAP_SEQUENTIAL |
+    SQLITE_IOCAP_SAFE_APPEND |
+    SQLITE_IOCAP_SEQUENTIAL |
     SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN;
 }
 
