@@ -28,11 +28,6 @@
 extern "C" {
 #endif
 
-// Size of the write buffer used by journal files in bytes.
-#ifndef SQLITE_RCVFS_BUFFERSZ
-# define SQLITE_RCVFS_BUFFERSZ 8192
-#endif
-
 // Default page size
 #ifndef SQLITE_RCVFS_BLOCKSZ
 # define SQLITE_RCVFS_BLOCKSZ 1024
