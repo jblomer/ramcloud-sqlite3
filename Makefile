@@ -41,4 +41,4 @@ clean:
 	rm -f *.o *.d
 	rm -f libsqlite3.a
 	rm -f libvfs-ramcloud.a
-	rm -f test test2 test3 download upload
+	rm -f test test2 test3 download upload delete
